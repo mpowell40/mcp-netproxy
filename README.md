@@ -7,6 +7,3 @@ A deterministic network-level reverse proxy that intercepts and validates Model 
 - **Core Security:** Enforces deterministic structural schema and egress boundary policies to prevent unauthorized local file access, credential theft, and command injection caused by prompt injection.
 - **Threat Model:** Documented in [THREAT_MODEL.md](THREAT_MODEL.md).
 
-## Quickstart (Docker Compose)
-```bash
-docker compose up --build -d
