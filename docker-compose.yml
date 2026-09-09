@@ -1,0 +1,14 @@
+services:
+  proxy:
+    build: ./proxy
+    ports:
+      - "8000:8000"
+    environment:
+      - DOWNSTREAM_URL=http://mock-mcp:9000/mcp
+    depends_on:
+      - mock-mcp
+
+  mock-mcp:
+    build: ./mock-mcp
+    ports:
+      - "9000:9000"

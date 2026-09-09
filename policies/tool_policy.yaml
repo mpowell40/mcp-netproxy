@@ -1,0 +1,27 @@
+version: "1.0"
+policies:
+  - tool_name: "read_file"
+    allowed_methods:
+      - "tools/call"
+    parameter_rules:
+      path:
+        type: "string"
+        disallow_patterns:
+          - "../"
+          - "..\\"
+          - "/etc/"
+          - ".env"
+        max_length: 255
+
+  - tool_name: "execute_command"
+    allowed_methods:
+      - "tools/call"
+    parameter_rules:
+      command:
+        type: "string"
+        disallow_patterns:
+          - "curl"
+          - "wget"
+          - ";"
+          - "|"
+          - ">"
