@@ -5,6 +5,7 @@ services:
       - "8000:8000"
     environment:
       - DOWNSTREAM_URL=http://mock-mcp:9000/mcp
+      - PYTHONUNBUFFERED=1
     depends_on:
       - mock-mcp
 
