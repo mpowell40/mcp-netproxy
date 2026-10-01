@@ -20,7 +20,8 @@ Traditional API gateways and payload filters inspect requests in **isolation**:
 - Calling `write_file({"path": "output.txt", "content": "hello"})` is benign on its own.
 
 Because both calls have valid syntax and harmless parameter strings, single-turn regex filters and static firewalls allow both through. The security hazard is **not** the syntax of an individual payload—it is the **temporal sequence of actions**:
-$$\text{UNTRUSTED\_INGEST} \longrightarrow \text{LOCAL\_WRITE} \quad \text{or} \quad \text{UNTRUSTED\_INGEST} \longrightarrow \text{EXECUTE}$$
+
+`UNTRUSTED_INGEST` → `LOCAL_WRITE` &nbsp;or&nbsp; `UNTRUSTED_INGEST` → `EXECUTE`
 
 Once an agent absorbs untrusted external data, allowing it to transition directly into file system modification, command execution, or network exfiltration creates an unconstrained attack surface. `mcp-netproxy` solves this by enforcing stateful transition invariants across the entire multi-turn session lifecycle.
 
@@ -64,7 +65,7 @@ Once an agent absorbs untrusted external data, allowing it to transition directl
 3. **Dynamic Tool Discovery & Classification ([`src/engine/classifier.py`](file:///c:/Users/themi/OneDrive/Desktop/CS_6727_Practicum/mcp-proxy-testbed/src/engine/classifier.py))**
    - Intercepts downstream `tools/list` responses during agent initialization.
    - For any previously unseen tool, the proxy analyzes its `name`, `description`, and `inputSchema` parameters using a deterministic priority hierarchy:
-     $$\text{EXECUTE} \longrightarrow \text{UNTRUSTED\_INGEST} \longrightarrow \text{LOCAL\_WRITE} \longrightarrow \text{LOCAL\_READ} \longrightarrow \text{DISCOVERY} \longrightarrow \text{NETWORK\_EGRESS} \longrightarrow \text{UNKNOWN}$$
+     `EXECUTE` → `UNTRUSTED_INGEST` → `LOCAL_WRITE` → `LOCAL_READ` → `DISCOVERY` → `NETWORK_EGRESS` → `UNKNOWN`
    - Dynamically registers newly classified tools into the active policy mapping without requiring manual YAML modifications or proxy restarts.
    - Unclassifiable tools default to `UNKNOWN`, which is blocked by default under Zero Trust principles.
 
@@ -223,27 +224,8 @@ X-Session-ID: session-alpha-1
 
 ---
 
-### Visual Audit & Forensic State Diagrams
-
-`mcp-netproxy` provides an exportable visual trajectory for every active session. You can query the proxy to inspect the runtime state graph:
-
-```http
-GET /session/session-alpha-1/graph HTTP/1.1
-Host: localhost:8000
-```
-
-The endpoint returns a Mermaid.js diagram highlighting permitted routes in green and rejected transitions in red:
-
-```mermaid
-stateDiagram-v2
-    START --> UNTRUSTED_INGEST : fetch ✅
-    UNTRUSTED_INGEST --> LOCAL_WRITE : write_file ❌ BLOCKED
-    classDef blocked fill:#ff4444,color:#fff,stroke:#cc0000
-    class LOCAL_WRITE blocked
-```
-
 ### Deterministic Performance Overhead
 Because the DFA validation is implemented via in-memory set lookups and enum comparisons protected by fine-grained session locks, evaluation latency is strictly deterministic:
-- **Enforcement overhead:** $< 0.01\,\text{ms}$ (typically $2\text{--}3\,\mu\text{s}$)
-- **Target budget:** $< 15\,\text{ms}$
+- **Enforcement overhead:** `< 0.01 ms` (typically `2–3 µs`)
+- **Target budget:** `< 15 ms`
 - **Downstream impact:** Negligible overhead added to legitimate agent tool execution.
