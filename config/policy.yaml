@@ -1,0 +1,108 @@
+# ============================================================================
+# mcp-netproxy Behavioral State-Machine Policy
+# ============================================================================
+# Defines the DFA state space for Zero Trust enforcement of MCP tool calls.
+# Compatible with @modelcontextprotocol/server-filesystem and server-fetch.
+# ============================================================================
+
+# Maps concrete MCP tool names to abstract DFA states.
+tool_mappings:
+  # Discovery tools
+  list_tools: DISCOVERY
+  list_allowed_directories: DISCOVERY
+  list_directory: DISCOVERY
+  search_files: DISCOVERY
+
+  # Local read-only tools
+  read_file: LOCAL_READ
+  read_multiple_files: LOCAL_READ
+  get_file_info: LOCAL_READ
+
+  # Local write/modify tools
+  write_file: LOCAL_WRITE
+  edit_file: LOCAL_WRITE
+  create_directory: LOCAL_WRITE
+  move_file: LOCAL_WRITE
+
+  # Untrusted external data ingestion
+  fetch: UNTRUSTED_INGEST
+  browser_action: UNTRUSTED_INGEST
+  web_search: UNTRUSTED_INGEST
+  scrape_url: UNTRUSTED_INGEST
+
+  # Privileged execution
+  execute_command: EXECUTE
+  bash: EXECUTE
+  run_script: EXECUTE
+
+  # Network egress (data exfiltration surface)
+  send_webhook: NETWORK_EGRESS
+  upload_file: NETWORK_EGRESS
+  send_email: NETWORK_EGRESS
+
+# Directed edges in the DFA.  from_state -> [to_states]
+# Any transition NOT listed here is denied by default.
+allowed_transitions:
+  START:
+    - DISCOVERY
+    - LOCAL_READ
+    - UNTRUSTED_INGEST
+
+  DISCOVERY:
+    - DISCOVERY
+    - LOCAL_READ
+    - LOCAL_WRITE
+    - UNTRUSTED_INGEST
+    - EXECUTE
+
+  LOCAL_READ:
+    - DISCOVERY
+    - LOCAL_READ
+    - LOCAL_WRITE
+    - EXECUTE
+    - UNTRUSTED_INGEST
+
+  LOCAL_WRITE:
+    - DISCOVERY
+    - LOCAL_READ
+    - LOCAL_WRITE
+    - EXECUTE
+
+  UNTRUSTED_INGEST:
+    - DISCOVERY
+    - LOCAL_READ
+    - UNTRUSTED_INGEST
+
+  EXECUTE:
+    - DISCOVERY
+    - LOCAL_READ
+    - LOCAL_WRITE
+    - EXECUTE
+
+  NETWORK_EGRESS:
+    - DISCOVERY
+    - LOCAL_READ
+
+# Invariant rules that trigger fatal violations regardless of allowed_transitions.
+# These model hard security boundaries against indirect prompt injection.
+forbidden_invariants:
+  - from_state: UNTRUSTED_INGEST
+    to_state: LOCAL_WRITE
+    reason: >-
+      Forbidden direct transition from untrusted ingestion to privileged
+      local write — possible indirect prompt injection vector
+    unless_visited: []
+
+  - from_state: UNTRUSTED_INGEST
+    to_state: EXECUTE
+    reason: >-
+      Forbidden direct transition from untrusted ingestion to command
+      execution — possible remote code execution via prompt injection
+    unless_visited: []
+
+  - from_state: UNTRUSTED_INGEST
+    to_state: NETWORK_EGRESS
+    reason: >-
+      Forbidden direct transition from untrusted ingestion to network
+      egress — possible data exfiltration channel
+    unless_visited: []

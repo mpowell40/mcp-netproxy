@@ -1,11 +1,14 @@
 services:
   proxy:
-    build: ./proxy
+    build: .
     ports:
       - "8000:8000"
     environment:
-      - DOWNSTREAM_URL=http://mock-mcp:9000/mcp
+      - MCP_BACKEND_URL=http://mock-mcp:9000/mcp
+      - POLICY_PATH=/app/config/policy.yaml
       - PYTHONUNBUFFERED=1
+    volumes:
+      - ./config:/app/config:ro
     depends_on:
       - mock-mcp
 
