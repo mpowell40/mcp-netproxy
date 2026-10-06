@@ -208,10 +208,12 @@ class TestIndirectPromptInjectionPrevented:
         # The key check is that the DFA state advanced to UNTRUSTED_INGEST.
         assert resp1.status_code in (200, 502)
 
-        # Second: attempt write_file (must be blocked)
+        # Second: attempt write_file (must be blocked by DFA invariant).
+        # Use a sandbox-internal path so Layer 1 boundary check passes and
+        # the DFA Layer 2 catches the UNTRUSTED_INGEST -> LOCAL_WRITE violation.
         resp2 = app_client.post(
             "/mcp",
-            json=_jsonrpc_tool_call("write_file", {"path": "/tmp/evil.txt", "content": "pwned"}, req_id=2),
+            json=_jsonrpc_tool_call("write_file", {"path": "/mcp-proxy-testbed/sandbox/evil.txt", "content": "pwned"}, req_id=2),
             headers={"X-Session-ID": "http-attack-001"},
         )
         assert resp2.status_code == 200

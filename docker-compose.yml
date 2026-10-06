@@ -16,3 +16,5 @@ services:
     build: ./mock-mcp
     ports:
       - "9000:9000"
+    volumes:
+      - .:/mcp-proxy-testbed

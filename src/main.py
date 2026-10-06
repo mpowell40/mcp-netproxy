@@ -11,9 +11,11 @@ previously-unseen tools using the heuristic classifier engine.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import pathlib
 import re
+import sys
 from typing import Any
 
 import httpx
@@ -23,6 +25,18 @@ from fastapi import FastAPI, Request, Response
 from src.engine.classifier import classify_tool
 from src.engine.state_machine import SessionGraphManager
 from src.models.policy import PolicyConfig
+
+# ---------------------------------------------------------------------------
+# Logging Setup
+# ---------------------------------------------------------------------------
+logger = logging.getLogger("mcp-netproxy")
+if not logger.handlers:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s - [%(name)s] - %(levelname)s - %(message)s")
+    )
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
 # ---------------------------------------------------------------------------
 # Default paths / env
@@ -94,23 +108,50 @@ def create_app(
         arguments: dict = params.get("arguments", {})
         arg_string = " ".join(str(v) for v in arguments.values())
 
-        # -- Layer 1: Heuristic regex inspection (original logic) --------
-        if (
-            re.search(TRAVERSAL_PATTERN, arg_string)
-            or re.search(SHELL_INJECTION, arg_string)
-            or re.search(AWS_KEY_PATTERN, arg_string)
+        # -- Layer 1: Heuristic & Scope Boundary inspection -------------
+        is_traversal = bool(re.search(TRAVERSAL_PATTERN, arg_string))
+        is_shell = bool(re.search(SHELL_INJECTION, arg_string))
+        is_aws_key = bool(re.search(AWS_KEY_PATTERN, arg_string))
+
+        # Scope boundary check: ensure filesystem tools remain inside /sandbox
+        path_arg = str(arguments.get("path", ""))
+        is_out_of_sandbox = False
+        if path_arg and tool_name in (
+            "read_text_file", "read_media_file", "write_file", "edit_file",
+            "read_file", "list_directory", "list_allowed_directories", "get_file_info",
         ):
+            normalized = os.path.normpath(path_arg).replace("\\", "/")
+            allowed_prefixes = (
+                "/mcp-proxy-testbed/sandbox",
+                "/sandbox",
+            )
+            # Must either equal the sandbox root or reside inside it
+            if not any(normalized == p or normalized.startswith(f"{p}/") for p in allowed_prefixes):
+                is_out_of_sandbox = True
+
+        if is_traversal or is_shell or is_aws_key or is_out_of_sandbox:
+            reason = (
+                "Malicious pattern detected"
+                if (is_traversal or is_shell or is_aws_key)
+                else "Path outside sandbox boundary"
+            )
+            logger.warning(
+                f"[SECURITY BLOCKED - HEURISTIC] Intercepted '{tool_name}' ({reason}) with args {arguments} from session '{session_id}'"
+            )
             return _jsonrpc_error(
                 request_id,
                 -32602,
-                "Policy Violation: Malicious payload pattern blocked by proxy",
+                f"Policy Violation: {reason} blocked by proxy",
                 status=200,
             )
-
         # -- Layer 2: Behavioral DFA enforcement -------------------------
         allowed, reason, meta = _engine.evaluate_transition(session_id, tool_name)
 
         if not allowed:
+            logger.warning(
+                f"[SECURITY BLOCKED - DFA INVARIANT] Session '{session_id}' denied transition: "
+                f"tool='{tool_name}', state='{meta['from_state']}' -> '{meta['to_state']}', reason='{reason}'"
+            )
             return _jsonrpc_error(
                 request_id,
                 -32001,

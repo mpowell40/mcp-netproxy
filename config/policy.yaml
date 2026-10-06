@@ -15,6 +15,8 @@ tool_mappings:
 
   # Local read-only tools
   read_file: LOCAL_READ
+  read_text_file: LOCAL_READ
+  read_media_file: LOCAL_READ
   read_multiple_files: LOCAL_READ
   get_file_info: LOCAL_READ
 
@@ -52,15 +54,17 @@ allowed_transitions:
     - DISCOVERY
     - LOCAL_READ
     - LOCAL_WRITE
-    - UNTRUSTED_INGEST
     - EXECUTE
+    - UNTRUSTED_INGEST
+    - NETWORK_EGRESS
 
   LOCAL_READ:
-    - DISCOVERY
     - LOCAL_READ
     - LOCAL_WRITE
     - EXECUTE
+    - DISCOVERY
     - UNTRUSTED_INGEST
+    - NETWORK_EGRESS
 
   LOCAL_WRITE:
     - DISCOVERY
@@ -71,7 +75,10 @@ allowed_transitions:
   UNTRUSTED_INGEST:
     - DISCOVERY
     - LOCAL_READ
-    - UNTRUSTED_INGEST
+    # Note: LOCAL_WRITE, EXECUTE, and NETWORK_EGRESS are deliberately
+    # omitted here to block indirect prompt injection at the transition
+    # layer. The forbidden_invariants below provide a second explicit
+    # enforcement layer with detailed audit reasons.
 
   EXECUTE:
     - DISCOVERY
@@ -89,20 +96,20 @@ forbidden_invariants:
   - from_state: UNTRUSTED_INGEST
     to_state: LOCAL_WRITE
     reason: >-
-      Forbidden direct transition from untrusted ingestion to privileged
-      local write — possible indirect prompt injection vector
+      Untrusted ingestion cannot directly mutate local files
+      (mitigating indirect prompt injection).
     unless_visited: []
 
   - from_state: UNTRUSTED_INGEST
     to_state: EXECUTE
     reason: >-
-      Forbidden direct transition from untrusted ingestion to command
-      execution — possible remote code execution via prompt injection
+      Untrusted ingestion cannot trigger command execution
+      (mitigating confused deputy).
     unless_visited: []
 
   - from_state: UNTRUSTED_INGEST
     to_state: NETWORK_EGRESS
     reason: >-
-      Forbidden direct transition from untrusted ingestion to network
-      egress — possible data exfiltration channel
+      Untrusted ingestion cannot exfiltrate data over external
+      network.
     unless_visited: []
