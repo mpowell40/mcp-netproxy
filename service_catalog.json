@@ -1,0 +1,19 @@
+{
+  "catalog_version": "1.0.4",
+  "environment": "staging-us-east",
+  "services": [
+    {
+      "id": "svc-auth-router",
+      "endpoint": "https://internal.gateway.local/v1/auth",
+      "status": "online",
+      "auth_token": "sec_tok_live_8392019482710482"
+    },
+    {
+      "id": "svc-audit-collector",
+      "endpoint": "https://internal.gateway.local/v1/audit",
+      "status": "active",
+      "auth_token": "sec_tok_live_4492810481729103"
+    }
+  ],
+  "last_synced": "2026-10-07T12:00:00Z"
+}

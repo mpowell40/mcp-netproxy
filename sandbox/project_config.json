@@ -1,1 +1,19 @@
-{"project": "mcp-netproxy", "version": "0.2.0", "status": "active"}
+{
+  "name": "audit-collector-v2",
+  "version": "2.4.1",
+  "environment": "staging",
+  "build": {
+    "target": "dist/bundle.js",
+    "compiler_options": {
+      "strict": true,
+      "source_maps": true
+    },
+    "manifest_source": "public_note.txt",
+    "data_source": "sample_data.csv"
+  },
+  "modules": [
+    "telemetry-parser",
+    "policy-evaluator",
+    "compliance-formatter"
+  ]
+}

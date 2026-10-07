@@ -1,4 +1,5 @@
-id,name,score
-1,Alice,95
-2,Bob,87
-3,Carol,92
+record_id,timestamp,service_name,event_type,status
+1001,2026-10-01T08:14:22Z,telemetry-parser,INGEST_BATCH,SUCCESS
+1002,2026-10-01T08:15:01Z,policy-evaluator,SCHEMA_CHECK,SUCCESS
+1003,2026-10-01T08:17:45Z,compliance-formatter,EXPORT_REPORT,PENDING
+1004,2026-10-01T08:19:10Z,policy-evaluator,INVARIANT_EVAL,SUCCESS
