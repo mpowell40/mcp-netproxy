@@ -59,6 +59,7 @@ class PolicyConfig(BaseModel):
     tool_mappings: dict[str, ToolState]
     allowed_transitions: dict[ToolState, list[ToolState]]
     forbidden_invariants: list[ForbiddenInvariant] = Field(default_factory=list)
+    untrusted_paths: list[str] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
@@ -82,12 +83,33 @@ class PolicyConfig(BaseModel):
             raw = yaml.safe_load(fh)
         return cls.model_validate(raw)
 
-    def resolve_state(self, tool_name: str) -> ToolState:
-        """Map a concrete tool name to its abstract ToolState.
+    def resolve_state(
+        self, tool_name: str, arguments: dict[str, Any] | None = None
+    ) -> ToolState:
+        """Map a concrete tool name (and optional arguments) to its abstract ToolState.
 
+        If arguments target a path matching untrusted_paths for a read tool,
+        resolves to ToolState.UNTRUSTED_INGEST.
         Returns ToolState.UNKNOWN for unmapped tools.
         """
-        return self.tool_mappings.get(tool_name, ToolState.UNKNOWN)
+        base_state = self.tool_mappings.get(tool_name, ToolState.UNKNOWN)
+        if arguments and self.untrusted_paths and base_state == ToolState.LOCAL_READ:
+            path_val = str(
+                arguments.get("path")
+                or arguments.get("file")
+                or arguments.get("filepath")
+                or ""
+            )
+            if path_val:
+                import fnmatch
+                for pattern in self.untrusted_paths:
+                    if (
+                        fnmatch.fnmatch(path_val.lower(), pattern.lower())
+                        or fnmatch.fnmatch(pathlib.Path(path_val).name.lower(), pattern.lower())
+                    ):
+                        return ToolState.UNTRUSTED_INGEST
+
+        return base_state
 
     def is_transition_allowed(self, from_state: ToolState, to_state: ToolState) -> bool:
         """Check whether a directed edge exists in allowed_transitions."""

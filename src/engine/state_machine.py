@@ -62,7 +62,7 @@ class SessionGraphManager:
     # -- public API ------------------------------------------------------
 
     def evaluate_transition(
-        self, session_id: str, tool_name: str
+        self, session_id: str, tool_name: str, arguments: dict[str, Any] | None = None
     ) -> tuple[bool, str, dict[str, Any]]:
         """Evaluate whether *tool_name* is legal for *session_id*.
 
@@ -75,7 +75,7 @@ class SessionGraphManager:
 
         with slock:
             from_state = session.current_state
-            to_state = self._policy.resolve_state(tool_name)
+            to_state = self._policy.resolve_state(tool_name, arguments)
 
             meta: dict[str, Any] = {
                 "session_id": session_id,

@@ -145,7 +145,7 @@ def create_app(
                 status=200,
             )
         # -- Layer 2: Behavioral DFA enforcement -------------------------
-        allowed, reason, meta = _engine.evaluate_transition(session_id, tool_name)
+        allowed, reason, meta = _engine.evaluate_transition(session_id, tool_name, arguments)
 
         if not allowed:
             logger.warning(

@@ -389,3 +389,58 @@ class TestNonToolCallPassthrough:
         # Should get a downstream error (no real backend), not a policy error
         body = resp.json()
         assert body.get("error", {}).get("code") != -32001
+
+
+# ===========================================================================
+# 7. Untrusted Path Ingestion & In-Sandbox Prompt Injection Defense
+# ===========================================================================
+
+class TestUntrustedPathPromptInjection:
+    """Verify that reading an untrusted file taints session state and blocks subsequent writes."""
+
+    def test_untrusted_file_read_taints_and_blocks_insandbox_write(self, app_client, engine):
+        """Reading public_note.txt transitions state to UNTRUSTED_INGEST.
+        A subsequent write to a completely valid sandbox path passes Layer 1
+        boundary checks but is caught and blocked by Layer 2 DFA invariants (-32001).
+        """
+        sid = "untrusted-ingest-001"
+
+        # Step 1: Read public_note.txt (ingests untrusted input)
+        resp1 = app_client.post(
+            "/mcp",
+            json=_jsonrpc_tool_call(
+                "read_text_file",
+                {"path": "/mcp-proxy-testbed/sandbox/public_note.txt"},
+                req_id=1,
+            ),
+            headers={"X-Session-ID": sid},
+        )
+        assert resp1.status_code in (200, 502)
+
+        # Confirm session state is now UNTRUSTED_INGEST
+        history = engine.get_session_history(sid)
+        assert len(history) == 1
+        assert history[0].to_state.value == "UNTRUSTED_INGEST"
+
+        # Step 2: Attempt to write to a valid sandbox path following injection directive
+        resp2 = app_client.post(
+            "/mcp",
+            json=_jsonrpc_tool_call(
+                "write_file",
+                {
+                    "path": "/mcp-proxy-testbed/sandbox/build_status.txt",
+                    "content": "Status: Build Compromised",
+                },
+                req_id=2,
+            ),
+            headers={"X-Session-ID": sid},
+        )
+        assert resp2.status_code == 200
+        body = resp2.json()
+        assert body["jsonrpc"] == "2.0"
+        assert body["id"] == 2
+        assert body["error"]["code"] == -32001
+        assert "Security Invariant Violation" in body["error"]["message"]
+        assert body["error"]["data"]["current_state"] == "UNTRUSTED_INGEST"
+        assert body["error"]["data"]["target_state"] == "LOCAL_WRITE"
+

@@ -42,6 +42,15 @@ tool_mappings:
   upload_file: NETWORK_EGRESS
   send_email: NETWORK_EGRESS
 
+# Paths or filename patterns that, when read, transition the session into UNTRUSTED_INGEST
+untrusted_paths:
+  - "*public_note*"
+  - "*note_layer2*"
+  - "*public*"
+  - "*untrusted*"
+  - "*external*"
+  - "*inbox*"
+
 # Directed edges in the DFA.  from_state -> [to_states]
 # Any transition NOT listed here is denied by default.
 allowed_transitions:
