@@ -134,7 +134,7 @@ async def handle_mcp(request: Request):
                 if "jsonrpc" in parsed and parsed.get("id") == req_id:
                     return Response(content=line, media_type="application/json")
             except json.JSONDecodeError:
-                print(f"[mock-mcp non-json stdout] {line}", flush=True)
+                print(f"[mcp-filesystem-backend non-json stdout] {line}", flush=True)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=9000)

@@ -1,21 +1,21 @@
 services:
-  proxy:
-    container_name: mcp-protected-proxy
+  protected:
+    container_name: mcp-protected
     build: .
     ports:
       - "8000:8000"
     environment:
-      - MCP_BACKEND_URL=http://mock-mcp:9000/mcp
+      - MCP_BACKEND_URL=http://unprotected:9000/mcp
       - POLICY_PATH=/app/config/policy.yaml
       - PYTHONUNBUFFERED=1
     volumes:
       - ./config:/app/config:ro
     depends_on:
-      - mock-mcp
+      - unprotected
 
-  mock-mcp:
-    container_name: mcp-unprotected-direct
-    build: ./mock-mcp
+  unprotected:
+    container_name: mcp-unprotected
+    build: ./mcp-filesystem-backend
     ports:
       - "9000:9000"
     volumes:
