@@ -1,5 +1,6 @@
 services:
   proxy:
+    container_name: mcp-protected-proxy
     build: .
     ports:
       - "8000:8000"
@@ -13,6 +14,7 @@ services:
       - mock-mcp
 
   mock-mcp:
+    container_name: mcp-unprotected-direct
     build: ./mock-mcp
     ports:
       - "9000:9000"
