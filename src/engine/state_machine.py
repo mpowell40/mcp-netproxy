@@ -34,6 +34,7 @@ class SessionState:
     current_state: ToolState = ToolState.START
     history: list[TransitionRecord] = field(default_factory=list)
     visited_states: set[ToolState] = field(default_factory=lambda: {ToolState.START})
+    is_tainted: bool = False
 
 
 class SessionGraphManager:
@@ -99,7 +100,35 @@ class SessionGraphManager:
                 meta["status"] = record.status
                 return False, reason, meta
 
-            # 2. Check forbidden invariants (takes priority over allowed)
+            # 2. Sticky taint latch check:
+            # If session is tainted, mutating or egress actions are strictly forbidden
+            if session.is_tainted and to_state in (
+                ToolState.LOCAL_WRITE,
+                ToolState.EXECUTE,
+                ToolState.NETWORK_EGRESS,
+            ):
+                reason = (
+                    "Session taint persistent latch: Untrusted ingestion cannot "
+                    "directly mutate local files or trigger privileged egress "
+                    "(mitigating indirect prompt injection)."
+                )
+                record = TransitionRecord(
+                    timestamp=time.time(),
+                    tool_name=tool_name,
+                    from_state=from_state,
+                    to_state=to_state,
+                    status="BLOCKED_INVARIANT",
+                    reason=reason,
+                )
+                session.history.append(record)
+                meta["status"] = record.status
+                meta["invariant_rule"] = {
+                    "from": from_state.value,
+                    "to": to_state.value,
+                }
+                return False, reason, meta
+
+            # 3. Check forbidden invariants (takes priority over allowed)
             violated: ForbiddenInvariant | None = self._policy.check_invariants(
                 from_state, to_state, session.visited_states
             )
@@ -121,7 +150,7 @@ class SessionGraphManager:
                 }
                 return False, reason, meta
 
-            # 3. Check allowed transitions
+            # 4. Check allowed transitions
             if not self._policy.is_transition_allowed(from_state, to_state):
                 reason = (
                     f"Transition {from_state.value} -> {to_state.value} "
@@ -139,9 +168,11 @@ class SessionGraphManager:
                 meta["status"] = record.status
                 return False, reason, meta
 
-            # 4. Valid: advance state
+            # 5. Valid: advance state
             session.current_state = to_state
             session.visited_states.add(to_state)
+            if to_state is ToolState.UNTRUSTED_INGEST:
+                session.is_tainted = True
             reason = "Allowed"
             record = TransitionRecord(
                 timestamp=time.time(),
@@ -161,6 +192,33 @@ class SessionGraphManager:
         """Return a copy of the transition history for a session."""
         session, _ = self._get_session(session_id)
         return list(session.history)
+
+    def taint_session(
+        self, session_id: str, taint_state: ToolState = ToolState.UNTRUSTED_INGEST
+    ) -> None:
+        """Retroactively taint a session's current state with a persistent sticky latch.
+
+        Used by the dynamic ingest scanner to override the DFA state when
+        response content analysis reveals untrusted directives. Once tainted,
+        session.is_tainted remains True persistently for the session lifetime,
+        blocking any subsequent mutating or egress actions even if intermediate
+        benign reads occur.
+        """
+        session, slock = self._get_session(session_id)
+        with slock:
+            from_state = session.current_state
+            session.is_tainted = True
+            session.current_state = taint_state
+            session.visited_states.add(taint_state)
+            record = TransitionRecord(
+                timestamp=time.time(),
+                tool_name="[dynamic_ingest_scan]",
+                from_state=from_state,
+                to_state=taint_state,
+                status="ALLOWED",
+                reason="Session tainted by dynamic response scanner",
+            )
+            session.history.append(record)
 
     def reset_session(self, session_id: str) -> None:
         """Reset a session back to START state."""

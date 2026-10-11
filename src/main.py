@@ -23,8 +23,9 @@ import uvicorn
 from fastapi import FastAPI, Request, Response
 
 from src.engine.classifier import classify_tool
+from src.engine.ingest_scanner import scan_payload_for_untrusted_directives
 from src.engine.state_machine import SessionGraphManager
-from src.models.policy import PolicyConfig
+from src.models.policy import PolicyConfig, ToolState
 
 # ---------------------------------------------------------------------------
 # Logging Setup
@@ -166,7 +167,41 @@ def create_app(
             )
 
         # -- Forward to downstream MCP server ----------------------------
-        return await _forward(payload, _downstream)
+        response = await _forward(payload, _downstream)
+
+        # -- Layer 3: Dynamic Ingest Scanner (response inspection) --------
+        # For read tools that returned successfully, scan the response
+        # content for imperative prompt-injection directives.
+        _READ_TOOLS = {
+            "read_text_file", "read_media_file", "read_file",
+            "read_multiple_files", "get_file_info",
+        }
+        if tool_name in _READ_TOOLS:
+            try:
+                resp_body = json.loads(response.body)
+                # Extract text from MCP result.content[].text
+                result = resp_body.get("result", {})
+                content_blocks = result.get("content", [])
+                extracted_texts = [
+                    block.get("text", "")
+                    for block in content_blocks
+                    if isinstance(block, dict) and block.get("type") == "text"
+                ]
+                full_text = "\n".join(extracted_texts)
+
+                if full_text.strip():
+                    scan_result = scan_payload_for_untrusted_directives(full_text)
+                    if scan_result.is_untrusted:
+                        # Retroactively taint the session
+                        _engine.taint_session(session_id, ToolState.UNTRUSTED_INGEST)
+                        logger.warning(
+                            f"[DYNAMIC INGEST SCANNER] Session '{session_id}' tainted "
+                            f"with UNTRUSTED_INGEST. Reason: {scan_result.reason}"
+                        )
+            except Exception:
+                pass  # Non-parseable response — leave session state as-is
+
+        return response
 
     # -----------------------------------------------------------------------
     # GET /session/{session_id}/graph  –  Mermaid diagram export
