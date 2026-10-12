@@ -1,11 +1,13 @@
 """mcp-netproxy: Zero Trust Policy Enforcement Point for MCP tool calls.
 
 Combines regex-based heuristic inspection with Behavioral State-Machine
-Invariant Enforcement.  Incoming JSON-RPC 2.0 ``tools/call`` requests are
-evaluated against the DFA *before* any downstream forwarding occurs.
+Invariant Enforcement and Egress Response Scanning across multiple
+downstream MCP backends (e.g., Filesystem MCP on :9000 and Fetch MCP on :9001).
 
-Additionally intercepts ``tools/list`` responses to dynamically classify
-previously-unseen tools using the heuristic classifier engine.
+Incoming JSON-RPC 2.0 ``tools/call`` requests are evaluated against the
+DFA *before* any downstream forwarding occurs.  Additionally intercepts
+``tools/list`` responses to multiplex tool schemas from all configured
+backends and dynamically classify previously-unseen tools.
 """
 
 from __future__ import annotations
@@ -44,37 +46,96 @@ if not logger.handlers:
 # ---------------------------------------------------------------------------
 _DEFAULT_POLICY = pathlib.Path(__file__).resolve().parent.parent / "config" / "policy.yaml"
 
-# Heuristic inspection patterns (kept from original proxy/main.py)
+# Heuristic inspection patterns (Layer 1)
 TRAVERSAL_PATTERN = r"(\.\./|\.\.\\|/etc/|~/\.ssh|~/\.env)"
 SHELL_INJECTION = r"(;|\||\&\&|\bcurl\b|\bbash\b)"
 AWS_KEY_PATTERN = r"(AKIA[0-9A-Z]{16})"
+
+# Static tool-to-backend category sets for multi-backend dispatch
+_FETCH_BACKEND_TOOLS = {
+    "fetch",
+}
+
+_FILESYSTEM_BACKEND_TOOLS = {
+    "read_file",
+    "read_text_file",
+    "read_media_file",
+    "read_multiple_files",
+    "write_file",
+    "edit_file",
+    "create_directory",
+    "list_directory",
+    "list_directory_with_sizes",
+    "directory_tree",
+    "move_file",
+    "search_files",
+    "get_file_info",
+    "list_allowed_directories",
+}
+
+# Read / content-ingestion tools whose responses are inspected by Layer 3
+_READ_TOOLS = {
+    "read_text_file",
+    "read_media_file",
+    "read_file",
+    "read_multiple_files",
+    "get_file_info",
+    "fetch",
+}
 
 
 def create_app(
     policy_config: PolicyConfig | None = None,
     graph_manager: SessionGraphManager | None = None,
     downstream_url: str | None = None,
+    fetch_downstream_url: str | None = None,
 ) -> FastAPI:
     """Factory function for the FastAPI application.
 
     Accepts optional pre-built policy/engine instances for testability.
-    Falls back to loading from environment / default paths when called
-    in production mode.
+    Coordinates multiplexing and routing between the Filesystem MCP backend
+    (:9000) and the Fetch MCP backend (:9001).
     """
-    app = FastAPI(title="MCP Enforcement Proxy (Behavioral DFA)")
+    app = FastAPI(title="MCP Enforcement Proxy (Multi-Backend Behavioral DFA)")
 
     # Resolve configuration
     policy_path = os.getenv("POLICY_PATH", str(_DEFAULT_POLICY))
     _policy = policy_config or PolicyConfig.from_yaml(policy_path)
     _engine = graph_manager or SessionGraphManager(_policy)
-    _downstream = downstream_url or os.getenv(
-        "MCP_BACKEND_URL",
-        os.getenv("DOWNSTREAM_URL", "http://mock-mcp:9000/mcp"),
+
+    _fs_downstream = downstream_url or os.getenv(
+        "MCP_FILESYSTEM_URL",
+        os.getenv(
+            "MCP_BACKEND_URL",
+            os.getenv("DOWNSTREAM_URL", "http://unprotected:9000/mcp"),
+        ),
     )
+    _fetch_downstream = fetch_downstream_url or os.getenv(
+        "MCP_FETCH_URL",
+        "http://fetch-backend:9001/mcp",
+    )
+
+    # Dynamic routing table populated with defaults and updated on tools/list
+    _tool_routes: dict[str, str] = {}
+    for t_name in _FILESYSTEM_BACKEND_TOOLS:
+        _tool_routes[t_name] = _fs_downstream
+    for t_name in _FETCH_BACKEND_TOOLS:
+        _tool_routes[t_name] = _fetch_downstream
+
+    def _resolve_backend_url(tool_name: str) -> str:
+        """Select the target backend URL for a given MCP tool call."""
+        if tool_name in _FETCH_BACKEND_TOOLS:
+            return _fetch_downstream
+        if tool_name in _tool_routes:
+            return _tool_routes[tool_name]
+        return _fs_downstream
 
     # Store on app.state for access in tests / introspection
     app.state.policy = _policy
     app.state.engine = _engine
+    app.state.filesystem_url = _fs_downstream
+    app.state.fetch_url = _fetch_downstream
+    app.state.tool_routes = _tool_routes
 
     # -----------------------------------------------------------------------
     # POST /mcp  –  main enforcement endpoint
@@ -93,13 +154,18 @@ def create_app(
         method = payload.get("method", "")
         params = payload.get("params", {})
 
-        # -- tools/list: forward then auto-classify discovered tools ------
+        # -- tools/list: multiplex across backends & auto-classify ---------
         if method == "tools/list":
-            return await _handle_tools_list(payload, _downstream, _policy)
+            return await _handle_tools_list(
+                payload,
+                [_fs_downstream, _fetch_downstream],
+                _policy,
+                _tool_routes,
+            )
 
-        # -- Non-tool-call requests pass through directly ----------------
+        # -- Non-tool-call requests pass through to primary backend -------
         if method != "tools/call":
-            return await _forward(payload, _downstream)
+            return await _forward(payload, _fs_downstream)
 
         # -- Extract session & tool context ------------------------------
         session_id = request.headers.get(
@@ -145,6 +211,7 @@ def create_app(
                 f"Policy Violation: {reason} blocked by proxy",
                 status=200,
             )
+
         # -- Layer 2: Behavioral DFA enforcement -------------------------
         allowed, reason, meta = _engine.evaluate_transition(session_id, tool_name, arguments)
 
@@ -166,16 +233,16 @@ def create_app(
                 status=200,
             )
 
-        # -- Forward to downstream MCP server ----------------------------
-        response = await _forward(payload, _downstream)
+        # -- Dispatch to target downstream MCP server (:9000 or :9001) ----
+        target_backend = _resolve_backend_url(tool_name)
+        logger.info(
+            f"[MULTI-BACKEND DISPATCH] Routing tool='{tool_name}' for session='{session_id}' -> {target_backend}"
+        )
+        response = await _forward(payload, target_backend)
 
         # -- Layer 3: Dynamic Ingest Scanner (response inspection) --------
-        # For read tools that returned successfully, scan the response
-        # content for imperative prompt-injection directives.
-        _READ_TOOLS = {
-            "read_text_file", "read_media_file", "read_file",
-            "read_multiple_files", "get_file_info",
-        }
+        # For read and fetch tools that returned content, scan the response
+        # payload for imperative prompt-injection directives.
         if tool_name in _READ_TOOLS:
             try:
                 resp_body = json.loads(response.body)
@@ -192,11 +259,11 @@ def create_app(
                 if full_text.strip():
                     scan_result = scan_payload_for_untrusted_directives(full_text)
                     if scan_result.is_untrusted:
-                        # Retroactively taint the session
+                        # Retroactively taint the session with sticky latch
                         _engine.taint_session(session_id, ToolState.UNTRUSTED_INGEST)
                         logger.warning(
                             f"[DYNAMIC INGEST SCANNER] Session '{session_id}' tainted "
-                            f"with UNTRUSTED_INGEST. Reason: {scan_result.reason}"
+                            f"with UNTRUSTED_INGEST from tool '{tool_name}'. Reason: {scan_result.reason}"
                         )
             except Exception:
                 pass  # Non-parseable response — leave session state as-is
@@ -242,10 +309,10 @@ def _jsonrpc_error(
 
 
 async def _forward(payload: dict, downstream_url: str) -> Response:
-    """Forward a JSON-RPC payload to the downstream MCP server."""
+    """Forward a JSON-RPC payload to the specified downstream MCP server."""
     async with httpx.AsyncClient() as client:
         try:
-            res = await client.post(downstream_url, json=payload, timeout=5.0)
+            res = await client.post(downstream_url, json=payload, timeout=10.0)
             return Response(
                 content=res.content,
                 status_code=res.status_code,
@@ -261,61 +328,92 @@ async def _forward(payload: dict, downstream_url: str) -> Response:
 
 
 async def _handle_tools_list(
-    payload: dict, downstream_url: str, policy: PolicyConfig
+    payload: dict,
+    downstream_urls: list[str],
+    policy: PolicyConfig,
+    tool_routes: dict[str, str] | None = None,
 ) -> Response:
-    """Forward ``tools/list``, intercept the response, and auto-classify.
+    """Multiplex ``tools/list`` across all configured backends and auto-classify.
 
-    Any tool in the downstream response whose name is not already in
-    ``policy.tool_mappings`` is run through the heuristic classifier and
-    registered dynamically so subsequent ``tools/call`` evaluations see it.
+    Queries each backend in ``downstream_urls``, merges their ``result.tools``
+    arrays into a unified schema response (deduplicated by tool name),
+    records the backend route for each tool, and runs any previously-unseen
+    tools through the heuristic classifier.
     """
-    async with httpx.AsyncClient() as client:
-        try:
-            res = await client.post(downstream_url, json=payload, timeout=5.0)
-        except Exception as exc:
-            return _jsonrpc_error(
-                payload.get("id"),
-                -32000,
-                f"Downstream connection error: {exc}",
-                status=502,
-            )
+    merged_tools: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    any_success = False
+    last_error: Exception | None = None
+    raw_fallback_response: httpx.Response | None = None
 
-    # Parse downstream response to inspect discovered tools
-    try:
-        body = res.json()
-    except Exception:
-        # Can't parse — pass the raw response through unchanged
+    async with httpx.AsyncClient() as client:
+        for backend_url in downstream_urls:
+            try:
+                res = await client.post(backend_url, json=payload, timeout=5.0)
+                any_success = True
+                raw_fallback_response = res
+            except Exception as exc:
+                last_error = exc
+                continue
+
+            try:
+                body = res.json()
+            except Exception:
+                continue
+
+            tools = body.get("result", {}).get("tools", [])
+            for tool in tools:
+                if not isinstance(tool, dict):
+                    continue
+                tool_name = tool.get("name", "")
+                if not tool_name:
+                    continue
+
+                if tool_routes is not None and tool_name not in _FETCH_BACKEND_TOOLS:
+                    tool_routes.setdefault(tool_name, backend_url)
+                elif tool_routes is not None and tool_name in _FETCH_BACKEND_TOOLS:
+                    tool_routes[tool_name] = backend_url
+
+                if tool_name not in seen_names:
+                    seen_names.add(tool_name)
+                    merged_tools.append(tool)
+
+                if tool_name not in policy.tool_mappings:
+                    inferred_state = classify_tool(
+                        name=tool_name,
+                        description=tool.get("description", ""),
+                        input_schema=tool.get("inputSchema", {}),
+                        policy=None,
+                    )
+                    policy.tool_mappings[tool_name] = inferred_state
+                    print(
+                        f"[DYNAMIC DISCOVERY] Classified new tool "
+                        f"'{tool_name}' as {inferred_state.value}"
+                    )
+
+    if not any_success:
+        return _jsonrpc_error(
+            payload.get("id"),
+            -32000,
+            f"Downstream connection error: {last_error}",
+            status=502,
+        )
+
+    if not merged_tools and raw_fallback_response is not None:
         return Response(
-            content=res.content,
-            status_code=res.status_code,
+            content=raw_fallback_response.content,
+            status_code=raw_fallback_response.status_code,
             media_type="application/json",
         )
 
-    tools = body.get("result", {}).get("tools", [])
-    for tool in tools:
-        tool_name = tool.get("name", "")
-        if not tool_name:
-            continue
-        if tool_name in policy.tool_mappings:
-            continue  # Already configured — skip
-
-        # Dynamically classify
-        inferred_state = classify_tool(
-            name=tool_name,
-            description=tool.get("description", ""),
-            input_schema=tool.get("inputSchema", {}),
-            policy=None,  # Skip policy lookup — we already know it's missing
-        )
-        policy.tool_mappings[tool_name] = inferred_state
-        print(
-            f"[DYNAMIC DISCOVERY] Classified new tool "
-            f"'{tool_name}' as {inferred_state.value}"
-        )
-
-    # Return the original downstream response unmodified
+    unified_body = {
+        "jsonrpc": "2.0",
+        "id": payload.get("id"),
+        "result": {"tools": merged_tools},
+    }
     return Response(
-        content=res.content,
-        status_code=res.status_code,
+        content=json.dumps(unified_body),
+        status_code=200,
         media_type="application/json",
     )
 

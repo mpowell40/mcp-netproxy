@@ -203,7 +203,7 @@ class TestClassifyTool:
     def test_explicit_policy_wins(self, policy):
         """Tools already in policy.tool_mappings bypass heuristics."""
         result = classify_tool("fetch", policy=policy)
-        assert result == ToolState.UNTRUSTED_INGEST  # From policy
+        assert result == ToolState.LOCAL_READ  # From policy (overrides heuristic UNTRUSTED_INGEST)
 
     def test_policy_overrides_heuristic(self, policy):
         # read_file is mapped in policy — should return from policy
@@ -364,8 +364,8 @@ class TestDynamicToolDFAInvariants:
                 headers={"X-Session-ID": "dfa-dynamic-001"},
             )
 
-        # Step 2: Do a fetch (transitions START -> UNTRUSTED_INGEST)
-        ok, _, _ = engine.evaluate_transition("dfa-dynamic-001", "fetch")
+        # Step 2: Do a static untrusted ingest (transitions START -> UNTRUSTED_INGEST)
+        ok, _, _ = engine.evaluate_transition("dfa-dynamic-001", "scrape_url")
         assert ok is True
 
         # Step 3: Attempt the dynamically-classified EXECUTE tool
@@ -407,8 +407,8 @@ class TestDynamicToolDFAInvariants:
                 headers={"X-Session-ID": "dfa-dynamic-002"},
             )
 
-        # Fetch first -> UNTRUSTED_INGEST
-        ok, _, _ = engine.evaluate_transition("dfa-dynamic-002", "fetch")
+        # Static untrusted ingest first -> UNTRUSTED_INGEST
+        ok, _, _ = engine.evaluate_transition("dfa-dynamic-002", "scrape_url")
         assert ok is True
 
         # Attempt write with dynamically classified tool
@@ -454,7 +454,7 @@ class TestDynamicToolDFAInvariants:
         assert ok is True, f"Expected ALLOWED, got: {reason}"
 
     def test_full_e2e_jsonrpc_error_on_dynamic_block(self, app_client, policy, engine):
-        """End-to-end: tools/list -> fetch -> dynamic-EXECUTE blocked at HTTP layer."""
+        """End-to-end: tools/list -> untrusted ingest -> dynamic-EXECUTE blocked at HTTP layer."""
         # Discover
         fake_tools = [
             {
@@ -478,8 +478,8 @@ class TestDynamicToolDFAInvariants:
                 headers={"X-Session-ID": "e2e-dynamic-001"},
             )
 
-        # Fetch (advance DFA to UNTRUSTED_INGEST) — use engine directly
-        engine.evaluate_transition("e2e-dynamic-001", "fetch")
+        # Advance DFA to UNTRUSTED_INGEST — use engine directly
+        engine.evaluate_transition("e2e-dynamic-001", "scrape_url")
 
         # Now call the dynamic tool via HTTP — should get -32001
         resp = app_client.post(
