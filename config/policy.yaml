@@ -5,27 +5,69 @@
 # Compatible with @modelcontextprotocol/server-filesystem and server-fetch.
 # ============================================================================
 
-# Maps concrete MCP tool names to abstract DFA states.
+# ----------------------------------------------------------------------------
+# Backend registry
+# ----------------------------------------------------------------------------
+# Each key is a backend namespace ([a-z][a-z0-9]*).  Every tool the backend
+# advertises is exposed to clients as "<namespace>__<tool>" (e.g.
+# fs__read_file) and evaluated by the DFA under that namespaced name.
+# Bare names (read_file) remain callable while exactly one backend serves
+# them; a bare name shared by several backends is rejected as ambiguous.
+#
+#   url             JSON-RPC endpoint (overridden by the url_env variable)
+#   capabilities    DFA states the backend may expose; discovered tools
+#                   classified outside this set are quarantined as UNKNOWN
+#   sandbox_roots   prefixes that every path argument must stay within
+#   path_arguments  argument names (string or list) checked against roots
+#   scan_responses  run the ingest scanner on LOCAL_READ/UNTRUSTED_INGEST
+#                   responses (sticky taint on injection directives)
+#   tools           explicit upstream tool name -> DFA state mappings
+default_backend: fs
+
+backends:
+  fs:  # @modelcontextprotocol/server-filesystem
+    url: http://unprotected:9000/mcp
+    url_env: MCP_FILESYSTEM_URL
+    capabilities: [DISCOVERY, LOCAL_READ, LOCAL_WRITE]
+    sandbox_roots:
+      - /mcp-proxy-testbed/sandbox
+      - /sandbox
+    path_arguments: [path, paths, source, destination]
+    scan_responses: true
+    tools:
+      list_allowed_directories: DISCOVERY
+      list_directory: DISCOVERY
+      list_directory_with_sizes: DISCOVERY
+      directory_tree: DISCOVERY
+      search_files: DISCOVERY
+      read_file: LOCAL_READ
+      read_text_file: LOCAL_READ
+      read_media_file: LOCAL_READ
+      read_multiple_files: LOCAL_READ
+      get_file_info: LOCAL_READ
+      write_file: LOCAL_WRITE
+      edit_file: LOCAL_WRITE
+      create_directory: LOCAL_WRITE
+      move_file: LOCAL_WRITE
+
+  web:  # mcp-server-fetch
+    url: http://fetch-backend:9001/mcp
+    url_env: MCP_FETCH_URL
+    capabilities: [LOCAL_READ, UNTRUSTED_INGEST]
+    scan_responses: true
+    tools:
+      # Remote content retrieval; taint is applied dynamically by the
+      # ingest scanner rather than statically on every fetch.
+      fetch: LOCAL_READ
+
+# ----------------------------------------------------------------------------
+# Global tool mappings
+# ----------------------------------------------------------------------------
+# Un-namespaced mappings for tools not owned by a registered backend.  These
+# route to default_backend and always take precedence over bare aliases.
 tool_mappings:
   # Discovery tools
   list_tools: DISCOVERY
-  list_allowed_directories: DISCOVERY
-  list_directory: DISCOVERY
-  search_files: DISCOVERY
-
-  # Local & remote read-only content retrieval (responses dynamically scanned by ingest_scanner)
-  read_file: LOCAL_READ
-  read_text_file: LOCAL_READ
-  read_media_file: LOCAL_READ
-  read_multiple_files: LOCAL_READ
-  get_file_info: LOCAL_READ
-  fetch: LOCAL_READ
-
-  # Local write/modify tools
-  write_file: LOCAL_WRITE
-  edit_file: LOCAL_WRITE
-  create_directory: LOCAL_WRITE
-  move_file: LOCAL_WRITE
 
   # Untrusted external data ingestion (unconditional static taint)
   browser_action: UNTRUSTED_INGEST

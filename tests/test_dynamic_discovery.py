@@ -21,11 +21,16 @@ import httpx
 import pytest
 
 from src.engine.classifier import classify_tool
-from src.models.policy import PolicyConfig, ToolState
+from src.models.policy import BackendConfig, PolicyConfig, ToolState
 
 # ---------------------------------------------------------------------------
 _PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
 _POLICY_PATH = _PROJECT_ROOT / "config" / "policy.yaml"
+
+# Test-only backend with unrestricted capabilities that advertises the
+# dynamically discovered tools; the registered fs/web backends return none.
+_LAB_URL = "http://lab-backend:9100/mcp"
+_WEB_URL = "http://fetch-backend:9001/mcp"
 
 
 # ===========================================================================
@@ -34,7 +39,9 @@ _POLICY_PATH = _PROJECT_ROOT / "config" / "policy.yaml"
 
 @pytest.fixture
 def policy():
-    return PolicyConfig.from_yaml(_POLICY_PATH)
+    p = PolicyConfig.from_yaml(_POLICY_PATH)
+    p.add_backend("lab", BackendConfig(url=_LAB_URL))
+    return p
 
 
 @pytest.fixture
@@ -72,6 +79,13 @@ def _mock_tools_list_response(tools: list[dict[str, Any]]) -> httpx.Response:
         "result": {"tools": tools},
     }
     return httpx.Response(200, json=body)
+
+
+def _serve_from(url: str, response: httpx.Response):
+    """Mock ``AsyncClient.post``: *url* returns *response*, other backends no tools."""
+    async def _post(target: str, json: dict, timeout: float = 5.0) -> httpx.Response:
+        return response if target == url else _mock_tools_list_response([])
+    return _post
 
 
 # ===========================================================================
@@ -263,7 +277,7 @@ class TestDynamicToolsListDiscovery:
 
         with patch("src.main.httpx.AsyncClient") as MockClient:
             instance = AsyncMock()
-            instance.post.return_value = mock_response
+            instance.post.side_effect = _serve_from(_LAB_URL, mock_response)
             instance.__aenter__ = AsyncMock(return_value=instance)
             instance.__aexit__ = AsyncMock(return_value=False)
             MockClient.return_value = instance
@@ -288,7 +302,7 @@ class TestDynamicToolsListDiscovery:
 
     def test_existing_tools_not_overwritten(self, app_client, policy):
         """Tools already in policy.tool_mappings must not be overwritten."""
-        original_state = policy.tool_mappings["fetch"]  # UNTRUSTED_INGEST
+        original_state = policy.tool_mappings["web__fetch"]  # declared by the web backend
 
         fake_tools = [
             {
@@ -301,7 +315,7 @@ class TestDynamicToolsListDiscovery:
 
         with patch("src.main.httpx.AsyncClient") as MockClient:
             instance = AsyncMock()
-            instance.post.return_value = mock_response
+            instance.post.side_effect = _serve_from(_WEB_URL, mock_response)
             instance.__aenter__ = AsyncMock(return_value=instance)
             instance.__aexit__ = AsyncMock(return_value=False)
             MockClient.return_value = instance
@@ -311,16 +325,17 @@ class TestDynamicToolsListDiscovery:
                 json=_jsonrpc("tools/list"),
             )
 
+        assert policy.tool_mappings["web__fetch"] == original_state
         assert policy.tool_mappings["fetch"] == original_state
 
     def test_tools_list_response_passed_through(self, app_client):
-        """The tools/list response body should be returned to the client."""
+        """The tools/list response body is returned with namespaced tool names."""
         tools = [{"name": "my_tool", "description": "A test tool", "inputSchema": {}}]
         mock_response = _mock_tools_list_response(tools)
 
         with patch("src.main.httpx.AsyncClient") as MockClient:
             instance = AsyncMock()
-            instance.post.return_value = mock_response
+            instance.post.side_effect = _serve_from(_LAB_URL, mock_response)
             instance.__aenter__ = AsyncMock(return_value=instance)
             instance.__aexit__ = AsyncMock(return_value=False)
             MockClient.return_value = instance
@@ -328,7 +343,7 @@ class TestDynamicToolsListDiscovery:
             resp = app_client.post("/mcp", json=_jsonrpc("tools/list"))
 
         body = resp.json()
-        assert body["result"]["tools"] == tools
+        assert body["result"]["tools"] == [{**tools[0], "name": "lab__my_tool"}]
 
 
 # ===========================================================================
@@ -353,7 +368,7 @@ class TestDynamicToolDFAInvariants:
 
         with patch("src.main.httpx.AsyncClient") as MockClient:
             instance = AsyncMock()
-            instance.post.return_value = mock_response
+            instance.post.side_effect = _serve_from(_LAB_URL, mock_response)
             instance.__aenter__ = AsyncMock(return_value=instance)
             instance.__aexit__ = AsyncMock(return_value=False)
             MockClient.return_value = instance
@@ -396,7 +411,7 @@ class TestDynamicToolDFAInvariants:
 
         with patch("src.main.httpx.AsyncClient") as MockClient:
             instance = AsyncMock()
-            instance.post.return_value = mock_response
+            instance.post.side_effect = _serve_from(_LAB_URL, mock_response)
             instance.__aenter__ = AsyncMock(return_value=instance)
             instance.__aexit__ = AsyncMock(return_value=False)
             MockClient.return_value = instance
@@ -432,7 +447,7 @@ class TestDynamicToolDFAInvariants:
 
         with patch("src.main.httpx.AsyncClient") as MockClient:
             instance = AsyncMock()
-            instance.post.return_value = mock_response
+            instance.post.side_effect = _serve_from(_LAB_URL, mock_response)
             instance.__aenter__ = AsyncMock(return_value=instance)
             instance.__aexit__ = AsyncMock(return_value=False)
             MockClient.return_value = instance
@@ -467,7 +482,7 @@ class TestDynamicToolDFAInvariants:
 
         with patch("src.main.httpx.AsyncClient") as MockClient:
             instance = AsyncMock()
-            instance.post.return_value = mock_response
+            instance.post.side_effect = _serve_from(_LAB_URL, mock_response)
             instance.__aenter__ = AsyncMock(return_value=instance)
             instance.__aexit__ = AsyncMock(return_value=False)
             MockClient.return_value = instance

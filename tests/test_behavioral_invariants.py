@@ -795,24 +795,24 @@ class TestMultiServerCrossBackendDefense:
     - tools/list merges schemas from both backends.
     - tools/call routes fetch to :9001 and filesystem tools to :9000.
     - Benign HTML fetch followed by write_file succeeds (no taint latch).
-    - Poisoned HTML fetch (portal_injection.html) triggers ingest_scanner.py,
+    - Poisoned HTML fetch (portal_update.html) triggers ingest_scanner.py,
       latches session.is_tainted = True, and blocks subsequent write_file with -32001.
     """
 
     _FIXTURES_DIR = _PROJECT_ROOT / "tests" / "fixtures"
 
     def test_html_fixtures_scanner_verdicts(self):
-        """Verify portal_injection.html triggers ingest_scanner and portal_clean.html passes."""
+        """Verify portal_update.html triggers ingest_scanner and portal_status.html passes."""
         from src.engine.ingest_scanner import scan_payload_for_untrusted_directives
 
-        poisoned_html = (self._FIXTURES_DIR / "portal_injection.html").read_text(encoding="utf-8")
-        clean_html = (self._FIXTURES_DIR / "portal_clean.html").read_text(encoding="utf-8")
+        poisoned_html = (self._FIXTURES_DIR / "portal_update.html").read_text(encoding="utf-8")
+        clean_html = (self._FIXTURES_DIR / "portal_status.html").read_text(encoding="utf-8")
 
         poison_res = scan_payload_for_untrusted_directives(poisoned_html)
-        assert poison_res.is_untrusted is True, "Expected portal_injection.html to be flagged"
+        assert poison_res.is_untrusted is True, "Expected portal_update.html to be flagged"
 
         clean_res = scan_payload_for_untrusted_directives(clean_html)
-        assert clean_res.is_untrusted is False, f"Expected portal_clean.html to be clean, got: {clean_res.reason}"
+        assert clean_res.is_untrusted is False, f"Expected portal_status.html to be clean, got: {clean_res.reason}"
 
     def test_multiplexed_tools_list_merges_filesystem_and_fetch_backends(self, policy, engine):
         """tools/list must query both :9000 and :9001 and return a unified tool array."""
@@ -861,7 +861,7 @@ class TestMultiServerCrossBackendDefense:
         assert resp.status_code == 200
         body = resp.json()
         merged_names = [t["name"] for t in body["result"]["tools"]]
-        assert merged_names == ["read_text_file", "write_file", "list_directory", "fetch"]
+        assert merged_names == ["fs__read_text_file", "fs__write_file", "fs__list_directory", "web__fetch"]
 
     def test_benign_html_fetch_then_write_file_succeeds(self, policy, engine):
         """Benign Path: A clean page fetch (:9001) followed by a legitimate
@@ -880,7 +880,7 @@ class TestMultiServerCrossBackendDefense:
         )
         client = TestClient(app)
         sid = "phase4-benign-session-01"
-        clean_html = (self._FIXTURES_DIR / "portal_clean.html").read_text(encoding="utf-8")
+        clean_html = (self._FIXTURES_DIR / "portal_status.html").read_text(encoding="utf-8")
         routed_urls: list[str] = []
 
         async def mock_post(url: str, json: dict, timeout: float = 10.0):
@@ -918,7 +918,7 @@ class TestMultiServerCrossBackendDefense:
                 "/mcp",
                 json=_jsonrpc_tool_call(
                     "fetch",
-                    {"url": "http://fetch-backend:9001/fixtures/portal_clean.html"},
+                    {"url": "http://fetch-backend:9001/fixtures/portal_status.html"},
                     req_id=1,
                 ),
                 headers={"X-Session-ID": sid},
@@ -956,7 +956,7 @@ class TestMultiServerCrossBackendDefense:
         ]
 
     def test_poisoned_html_fetch_triggers_scanner_taint_and_blocks_write_file(self, policy, engine):
-        """Poisoned Path: Fetching portal_injection.html (:9001) triggers
+        """Poisoned Path: Fetching portal_update.html (:9001) triggers
         ingest_scanner.py, latches session.is_tainted = True, and intercepts
         the subsequent write_file (:9000) with JSON-RPC error -32001.
         """
@@ -973,7 +973,7 @@ class TestMultiServerCrossBackendDefense:
         )
         client = TestClient(app)
         sid = "phase4-poisoned-session-01"
-        poisoned_html = (self._FIXTURES_DIR / "portal_injection.html").read_text(encoding="utf-8")
+        poisoned_html = (self._FIXTURES_DIR / "portal_update.html").read_text(encoding="utf-8")
         routed_urls: list[str] = []
 
         async def mock_post(url: str, json: dict, timeout: float = 10.0):
@@ -1004,7 +1004,7 @@ class TestMultiServerCrossBackendDefense:
                 "/mcp",
                 json=_jsonrpc_tool_call(
                     "fetch",
-                    {"url": "http://fetch-backend:9001/fixtures/portal_injection.html"},
+                    {"url": "http://fetch-backend:9001/fixtures/portal_update.html"},
                     req_id=1,
                 ),
                 headers={"X-Session-ID": sid},
