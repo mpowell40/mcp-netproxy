@@ -1,13 +1,12 @@
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import os
 import pathlib
 import sys
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse
-
-app = FastAPI(title="MCP Fetch Server HTTP Wrapper (@modelcontextprotocol/server-fetch)")
+from fastapi.responses import HTMLResponse, PlainTextResponse
 
 proc: asyncio.subprocess.Process | None = None
 read_lock = asyncio.Lock()
@@ -46,8 +45,8 @@ async def _read_jsonrpc_response(req_id: int | str, timeout_seconds: float = 15.
             print(f"[mcp-fetch-backend non-json stdout] {line}", flush=True)
 
 
-@app.on_event("startup")
-async def startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global proc, init_result_cache
     print("Starting official MCP Fetch server (mcp-server-fetch)...", flush=True)
 
@@ -64,6 +63,8 @@ async def startup():
 
     async def log_stderr():
         while True:
+            if not proc or not proc.stderr:
+                break
             line = await proc.stderr.readline()
             if not line:
                 break
@@ -83,31 +84,48 @@ async def startup():
                 "clientInfo": {"name": "mcp-netproxy-fetch-wrapper", "version": "1.0.0"},
             },
         }
-        proc.stdin.write((json.dumps(init_req) + "\n").encode("utf-8"))
-        await proc.stdin.drain()
-        init_resp = await _read_jsonrpc_response(0, timeout_seconds=10.0)
-        if init_resp:
-            init_result_cache = init_resp.get("result")
+        if proc.stdin:
+            proc.stdin.write((json.dumps(init_req) + "\n").encode("utf-8"))
+            await proc.stdin.drain()
+            init_resp = await _read_jsonrpc_response(0, timeout_seconds=10.0)
+            if init_resp:
+                init_result_cache = init_resp.get("result")
 
-        initialized_notif = {
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized",
-        }
-        proc.stdin.write((json.dumps(initialized_notif) + "\n").encode("utf-8"))
-        await proc.stdin.drain()
+            initialized_notif = {
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+            }
+            proc.stdin.write((json.dumps(initialized_notif) + "\n").encode("utf-8"))
+            await proc.stdin.drain()
 
     print("MCP Fetch server process spawned and initialized on port 9001.", flush=True)
 
+    yield
 
-@app.on_event("shutdown")
-async def shutdown():
-    global proc
+    # Teardown logic
     if proc:
         try:
             proc.terminate()
             await proc.wait()
         except Exception:
             pass
+
+
+app = FastAPI(
+    title="MCP Fetch Server HTTP Wrapper (@modelcontextprotocol/server-fetch)",
+    lifespan=lifespan,
+)
+
+
+@app.get("/robots.txt", response_class=PlainTextResponse)
+async def serve_robots():
+    """Explicitly permit automated fetch tools to access any fixture."""
+    return PlainTextResponse("User-agent: *\nAllow: /\n", status_code=200)
+
+
+@app.get("/", response_class=PlainTextResponse)
+async def health():
+    return PlainTextResponse("MCP Fetch Backend is operational.", status_code=200)
 
 
 @app.get("/fixtures/{filename}", response_class=HTMLResponse)
@@ -122,7 +140,7 @@ async def serve_fixture(filename: str):
 @app.post("/mcp")
 async def handle_mcp(request: Request):
     global proc
-    if not proc or proc.returncode is not None:
+    if not proc or proc.returncode is not None or not proc.stdin:
         return Response(
             content=json.dumps({
                 "jsonrpc": "2.0",
@@ -195,4 +213,3 @@ async def handle_mcp(request: Request):
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=9001)
-

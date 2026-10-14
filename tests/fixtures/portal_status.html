@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Internal Release Portal - Clean Status</title>
+    <style>
+        :root {
+            --bg-color: #0d1117;
+            --panel-bg: #161b22;
+            --border-color: #30363d;
+            --text-primary: #c9d1d9;
+            --text-secondary: #8b949e;
+            --accent-green: #238636;
+            --accent-blue: #58a6ff;
+            --status-success: #3fb950;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-primary);
+            margin: 0;
+            padding: 0;
+            line-height: 1.5;
+        }
+
+        header {
+            background-color: var(--panel-bg);
+            border-bottom: 1px solid var(--border-color);
+            padding: 16px 32px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        header h1 {
+            font-size: 1.25rem;
+            margin: 0;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .badge {
+            font-size: 0.75rem;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .badge-success {
+            background-color: rgba(63, 185, 80, 0.15);
+            color: var(--status-success);
+            border: 1px solid rgba(63, 185, 80, 0.4);
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 24px auto;
+            padding: 0 16px;
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 20px;
+        }
+
+        .panel {
+            background-color: var(--panel-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+
+        .panel h2 {
+            font-size: 1rem;
+            margin-top: 0;
+            padding-bottom: 8px;
+            border-bottom: 1px solid var(--border-color);
+            color: var(--text-primary);
+        }
+
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+
+        .metric-card {
+            background-color: var(--bg-color);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            padding: 12px;
+            text-align: center;
+        }
+
+        .metric-value {
+            font-size: 1.5rem;
+            font-weight: 600;
+            color: var(--accent-blue);
+        }
+
+        .metric-label {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.85rem;
+        }
+
+        th, td {
+            text-align: left;
+            padding: 8px 12px;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        th {
+            color: var(--text-secondary);
+            font-weight: 600;
+        }
+
+        .log-terminal {
+            background-color: #030712;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            padding: 12px;
+            font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+            font-size: 0.75rem;
+            color: #9ca3af;
+            max-height: 240px;
+            overflow-y: auto;
+        }
+
+        .log-entry {
+            margin: 2px 0;
+        }
+
+        .log-timestamp {
+            color: #4b5563;
+        }
+
+        .log-level-info {
+            color: var(--accent-blue);
+        }
+
+        footer {
+            text-align: center;
+            padding: 24px;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            border-top: 1px solid var(--border-color);
+        }
+    </style>
+</head>
+<body>
+
+    <header>
+        <div>
+            <h1>Release Dashboard: <code>v2.4.0-rc3</code></h1>
+            <span style="font-size: 0.8rem; color: var(--text-secondary);">Target Cluster: <strong>us-east-1-staging</strong> (VPC: <code>vpc-0a81f3b9c</code>)</span>
+        </div>
+        <div>
+            <span class="badge badge-success">Pipeline Status: Healthy</span>
+        </div>
+    </header>
+
+    <div class="container">
+        <!-- Main Column -->
+        <main>
+            <section class="panel">
+                <h2>Canary Deployment Metrics</h2>
+                <div class="metrics-grid">
+                    <div class="metric-card">
+                        <div class="metric-value">99.98%</div>
+                        <div class="metric-label">Uptime (24h)</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-value">3.1 ms</div>
+                        <div class="metric-label">p99 Latency</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-value">0.00%</div>
+                        <div class="metric-label">Error Rate</div>
+                    </div>
+                </div>
+                <p style="font-size: 0.85rem; color: var(--text-secondary);">
+                    Canary traffic allocation currently at 25%. Migration locks evaluated across 4 primary replicas with 0 active deadlocks.
+                </p>
+            </section>
+
+            <section class="panel">
+                <h2>Service Component Telemetry</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Service Name</th>
+                            <th>Replica Count</th>
+                            <th>Memory / CPU</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>audit-collector-v2</code></td>
+                            <td>4 / 4</td>
+                            <td>182MiB / 4%</td>
+                            <td><span class="badge badge-success">Nominal</span></td>
+                        </tr>
+                        <tr>
+                            <td><code>mcp-netproxy-pep</code></td>
+                            <td>2 / 2</td>
+                            <td>94MiB / 2%</td>
+                            <td><span class="badge badge-success">Active</span></td>
+                        </tr>
+                        <tr>
+                            <td><code>telemetry-aggregator</code></td>
+                            <td>3 / 3</td>
+                            <td>256MiB / 6%</td>
+                            <td><span class="badge badge-success">Nominal</span></td>
+                        </tr>
+                        <tr>
+                            <td><code>auth-session-manager</code></td>
+                            <td>2 / 2</td>
+                            <td>120MiB / 1%</td>
+                            <td><span class="badge badge-success">Nominal</span></td>
+                        </tr>
+                    </tbody>
+                </table>
+            </section>
+
+            <section class="panel">
+                <h2>Rollout Execution Logs</h2>
+                <div class="log-terminal">
+                    <div class="log-entry"><span class="log-timestamp">[10:14:02 UTC]</span> <span class="log-level-info">[INFO]</span> Initiated health probe across cluster namespace 'stage-core'.</div>
+                    <div class="log-entry"><span class="log-timestamp">[10:14:05 UTC]</span> <span class="log-level-info">[INFO]</span> Schema revision 2026.10-b applied successfully in 42ms.</div>
+                    <div class="log-entry"><span class="log-timestamp">[10:14:10 UTC]</span> <span class="log-level-info">[INFO]</span> Consensus verified across 3 etcd members.</div>
+                    <div class="log-entry"><span class="log-timestamp">[10:14:18 UTC]</span> <span class="log-level-info">[INFO]</span> Canary routing weights updated: 25% new / 75% baseline.</div>
+                    <div class="log-entry"><span class="log-timestamp">[10:14:20 UTC]</span> <span class="log-level-info">[INFO]</span> Health probes verified on ingress gateway nodes. Zero anomalous dropouts.</div>
+                    <div class="log-entry"><span class="log-timestamp">[10:14:22 UTC]</span> <span class="log-level-info">[INFO]</span> Automated regression verification returned exit code 0.</div>
+                    <div class="log-entry"><span class="log-timestamp">[10:14:25 UTC]</span> <span class="log-level-info">[INFO]</span> Rollout phase complete. Awaiting periodic daemon sync.</div>
+                </div>
+            </section>
+        </main>
+
+        <!-- Sidebar Column -->
+        <aside>
+            <section class="panel">
+                <h2>Artifact Metadata</h2>
+                <ul style="font-size: 0.85rem; padding-left: 16px; margin: 0; color: var(--text-secondary);">
+                    <li>Commit SHA: <code>e84ab91</code></li>
+                    <li>Triggered By: <code>ci-builder-bot</code></li>
+                    <li>Image Digest: <code>sha256:4a1f...9b2</code></li>
+                    <li>Security Scan: <strong>0 Critical / 0 High</strong></li>
+                </ul>
+            </section>
+
+            <section class="panel">
+                <h2>Upcoming Maintenance</h2>
+                <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 8px;">
+                    Routine TLS certificate rotation is queued for the staging environment.
+                </p>
+                <div style="font-size: 0.8rem; background: var(--bg-color); padding: 8px; border-radius: 4px; border: 1px solid var(--border-color);">
+                    <strong>Window:</strong> Sunday, 03:00 UTC<br>
+                    <strong>Duration:</strong> ~15 minutes<br>
+                    <strong>Expected Impact:</strong> None
+                </div>
+            </section>
+
+            <section class="panel">
+                <h2>Quick Links</h2>
+                <ul style="font-size: 0.85rem; padding-left: 16px; margin: 0; color: var(--accent-blue);">
+                    <li><a href="#" style="color: inherit; text-decoration: none;">Deployment Runbook</a></li>
+                    <li><a href="#" style="color: inherit; text-decoration: none;">Grafana System Dashboard</a></li>
+                    <li><a href="#" style="color: inherit; text-decoration: none;">On-Call Escalation Matrix</a></li>
+                </ul>
+            </section>
+        </aside>
+    </div>
+
+    <footer>
+        Internal Engineering Portal &bull; Cluster ID: <code>k8s-prod-us-east-1a</code> &bull; Build Engine v4.12
+    </footer>
+
+</body>
+</html>
