@@ -70,3 +70,25 @@ Each run writes to its `--out` directory (`eval/runs/baseline/` is the pre-fix b
 The harness resets `sandbox/`, `eval/canary/` and `sandbox_evil/` to their
 pre-run contents before and after every replay. Every call in a scenario is
 sent even after a block, so the outcome checks see what actually got through.
+
+## Testbed caveats
+
+- **Private-address exception (testbed only).** The egress policy refuses
+  hosts that resolve to private addresses, but `fetch-backend` (the fixture
+  server) lives on Docker's internal network, so `config/policy.yaml` lists it
+  under `private_hosts`. This exception exists only so fixtures can be
+  fetched in this testbed; a deployment fetching real sites should leave
+  `private_hosts` empty. Loopback, link-local and metadata addresses are
+  refused even for `private_hosts`.
+- **Relative paths are refused.** The sandbox check resolves every path
+  argument with `realpath` before comparing it to the sandbox roots. A
+  relative path depends on the backend's working directory, which the proxy
+  cannot know, so it fails closed. Clients must send absolute paths.
+- **Latency was measured on Docker Desktop / Windows.** The harness runs on
+  the Windows host; every POST into Docker pays a ~47 ms floor (measured
+  and subtracted from the blocked-call figure; it cancels out of overhead).
+  The proxy resolves symlinks on a bind mount of a Windows directory, so
+  each `realpath` crosses Docker Desktop's file-sharing layer (~21 ms per
+  path measured inside the container). On a native Linux mount this costs
+  microseconds, so overhead figures here overstate production cost.
+  Run-to-run variation is tens of milliseconds; compare medians.

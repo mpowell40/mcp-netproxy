@@ -863,11 +863,6 @@ class TestMultiServerCrossBackendDefense:
         merged_names = [t["name"] for t in body["result"]["tools"]]
         assert merged_names == ["fs__read_text_file", "fs__write_file", "fs__list_directory", "web__fetch"]
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Known false positive since fetch -> NETWORK_EGRESS: the policy has no "
-        "START -> NETWORK_EGRESS or NETWORK_EGRESS -> LOCAL_WRITE edge (eval H06/H07)",
-    )
     def test_benign_html_fetch_then_write_file_succeeds(self, policy, engine):
         """Benign Path: A clean page fetch (:9001) followed by a legitimate
         write_file (:9000) succeeds without triggering the taint latch.
@@ -978,7 +973,6 @@ class TestMultiServerCrossBackendDefense:
         )
         client = TestClient(app)
         sid = "phase4-poisoned-session-01"
-        engine.evaluate_transition(sid, "list_directory")  # START may not enter NETWORK_EGRESS
         poisoned_html = (self._FIXTURES_DIR / "portal_update.html").read_text(encoding="utf-8")
         routed_urls: list[str] = []
 

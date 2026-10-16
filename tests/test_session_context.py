@@ -230,8 +230,6 @@ class TestCheckpointEvents:
 class TestTaintVector:
 
     def test_dynamic_scan_records_source_and_pattern(self, client, engine):
-        engine.evaluate_transition("taint-01", "list_directory")  # START may not enter NETWORK_EGRESS
-
         async def post(url, json, timeout=10.0):
             return _result(json["id"], _INJECTION_TEXT)
 
@@ -433,7 +431,6 @@ class TestSessionIsolation:
             finally:
                 patcher.stop()
 
-        app.state.engine.evaluate_transition("race-01", "list_directory")  # START may not enter NETWORK_EGRESS
         fetch_body, write_body = asyncio.run(scenario())
         assert "result" in fetch_body
         assert write_body["error"]["code"] == -32001

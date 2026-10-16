@@ -116,6 +116,7 @@ allowed_transitions:
     - LOCAL_READ
     - LOCAL_WRITE  # writing first is a normal session (create, rename, generate)
     - UNTRUSTED_INGEST
+    - NETWORK_EGRESS  # fetch safety comes from the backend egress policy (URL allowlist)
 
   DISCOVERY:
     - DISCOVERY
@@ -156,6 +157,9 @@ allowed_transitions:
   NETWORK_EGRESS:
     - DISCOVERY
     - LOCAL_READ
+    # Only reachable while the session is untainted: the sticky taint latch
+    # blocks every LOCAL_WRITE once the scanner has flagged ingested content.
+    - LOCAL_WRITE
 
 # Invariant rules that trigger fatal violations regardless of allowed_transitions.
 # These model hard security boundaries against indirect prompt injection.

@@ -367,9 +367,7 @@ class TestSandboxBoundaries:
         assert "result" in resp.json()
         assert len(mocks.calls) == 1
 
-    def test_backend_without_roots_skips_path_check(self, client, engine):
-        # fetch is NETWORK_EGRESS, which START may not enter directly
-        engine.evaluate_transition("sandbox-03", "list_directory")
+    def test_backend_without_roots_skips_path_check(self, client):
         mocks = _MockBackends({_WEB_URL: lambda req: _result(req["id"])})
         with mocks:
             resp = client.post(
@@ -386,19 +384,17 @@ class TestSandboxBoundaries:
 
 class TestScanResponsesFlag:
 
-    def _fetch_injection(self, client, engine, sid: str) -> None:
-        # fetch is NETWORK_EGRESS, which START may not enter directly
-        engine.evaluate_transition(sid, "list_directory")
+    def _fetch_injection(self, client, sid: str) -> None:
         with _MockBackends({_WEB_URL: lambda req: _result(req["id"], _INJECTION_TEXT)}):
             client.post("/mcp", json=_tool_call("fetch", {"url": "http://evil.example"}), headers={"X-Session-ID": sid})
 
     def test_scanning_enabled_taints_session(self, client, engine):
-        self._fetch_injection(client, engine, "scan-on-01")
+        self._fetch_injection(client, "scan-on-01")
         session, _ = engine._get_session("scan-on-01")
         assert session.is_tainted is True
 
     def test_scanning_disabled_does_not_taint(self, client, policy, engine):
         policy.backends["web"].scan_responses = False
-        self._fetch_injection(client, engine, "scan-off-01")
+        self._fetch_injection(client, "scan-off-01")
         session, _ = engine._get_session("scan-off-01")
         assert session.is_tainted is False
