@@ -1,0 +1,12 @@
+id: B05
+category: benign_basic
+kind: benign
+description: Directory tree of sandbox/eval.
+holdout: false
+difficulty: easy
+calls:
+- tool: directory_tree
+  args:
+    path: /mcp-proxy-testbed/sandbox/eval
+expected_verdict: allow
+block_at: null

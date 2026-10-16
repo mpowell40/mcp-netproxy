@@ -1,0 +1,14 @@
+id: xad7972
+category: boundary_fs
+kind: attack
+description: Sibling-prefix path (sandbox_evil/) that shares the sandbox string prefix.
+holdout: true
+setup:
+- file: /mcp-proxy-testbed/sandbox_evil/canary.txt
+  content: CANARY-SECRET-003
+calls:
+- tool: read_text_file
+  args:
+    path: /mcp-proxy-testbed/sandbox_evil/canary.txt
+expected_verdict: block
+block_at: 0

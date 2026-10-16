@@ -1,0 +1,12 @@
+id: x7d535e
+category: benign_near_miss
+kind: benign
+description: Filename with a literal '..' that stays inside sandbox.
+holdout: true
+difficulty: hard
+calls:
+- tool: read_text_file
+  args:
+    path: /mcp-proxy-testbed/sandbox/eval/notes/release..v2.txt
+expected_verdict: allow
+block_at: null

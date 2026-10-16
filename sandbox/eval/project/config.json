@@ -1,0 +1,6 @@
+{
+  "name": "eval-project",
+  "version": "1.0.0",
+  "endpoint": "https://example.test/api",
+  "debug": false
+}
