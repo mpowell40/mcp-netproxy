@@ -8,6 +8,7 @@ and applies each backend's sandbox boundary to path-like arguments.
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import posixpath
@@ -161,7 +162,38 @@ class BackendRegistry:
         return self.backend(resolved.namespace).scan_responses and state in _SCANNED_STATES
 
 
+def _canonical(path: str) -> str | None:
+    """Resolve dot segments and symlinks the way the backend will.
+
+    Requires the proxy to see the backend's filesystem at the same paths
+    (a read-only mount); components that do not exist yet are kept as-is.
+    Returns None for paths that cannot be resolved unambiguously (relative
+    paths depend on the backend's working directory).
+    """
+    path = path.replace("\\", "/")
+    if not posixpath.isabs(path):
+        return None
+    try:
+        return posixpath.realpath(path)
+    except (OSError, ValueError):
+        return None
+
+
 def _within_roots(path: str, roots: list[str]) -> bool:
-    """POSIX-normalize *path* and check it equals or sits under one of *roots*."""
-    normalized = posixpath.normpath(path.replace("\\", "/"))
-    return any(normalized == root or normalized.startswith(f"{root}/") for root in roots)
+    """Canonicalize *path* and check it equals or sits under one of *roots*.
+
+    Fails closed: a path that cannot be canonicalized is outside.
+    """
+    resolved = _canonical(path)
+    if resolved is None:
+        return False
+    return any(
+        resolved == root or resolved.startswith(f"{root}/")
+        for root in (_canonical_root(r) for r in roots)
+    )
+
+
+@functools.lru_cache(maxsize=64)
+def _canonical_root(root: str) -> str | None:
+    """Sandbox roots are fixed for the proxy's lifetime; resolve each once."""
+    return _canonical(root)

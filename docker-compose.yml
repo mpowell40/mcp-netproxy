@@ -12,6 +12,9 @@ services:
       - PYTHONUNBUFFERED=1
     volumes:
       - ./config:/app/config:ro
+      # Same path the filesystem backend serves, read-only, so the sandbox
+      # check can resolve symlinks exactly as the backend will.
+      - .:/mcp-proxy-testbed:ro
     depends_on:
       - unprotected
       - fetch-backend

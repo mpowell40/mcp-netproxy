@@ -13,6 +13,7 @@ Validates:
 
 from __future__ import annotations
 
+import os
 import pathlib
 from unittest.mock import AsyncMock, patch
 
@@ -20,7 +21,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from src.engine.registry import BackendRegistry, ToolResolutionError
+from src.engine.registry import BackendRegistry, ToolResolutionError, _within_roots
 from src.engine.state_machine import SessionGraphManager
 from src.main import create_app
 from src.models.policy import BackendConfig, PolicyConfig, ToolState
@@ -327,6 +328,30 @@ class TestSandboxBoundaries:
             resp = client.post("/mcp", json=_tool_call(tool, args), headers={"X-Session-ID": "sandbox-01"})
         assert resp.json()["error"]["message"] == "Policy Violation: Path outside sandbox boundary blocked by proxy"
         assert mocks.calls == []
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "sandbox/a.txt",  # relative: depends on the backend's cwd
+            "../../etc/passwd",
+            "/mcp-proxy-testbed/sandbox/../service_catalog.json",
+            "/mcp-proxy-testbed/sandbox_evil/a.txt",  # shares the root's string prefix
+        ],
+    )
+    def test_uncanonical_paths_fail_closed(self, path):
+        assert not _within_roots(path, ["/mcp-proxy-testbed/sandbox"])
+
+    def test_dot_segments_resolving_inside_sandbox_allowed(self):
+        assert _within_roots("/mcp-proxy-testbed/sandbox/eval/../data.csv", ["/mcp-proxy-testbed/sandbox"])
+
+    @pytest.mark.skipif(os.name == "nt", reason="needs POSIX paths and unprivileged symlinks")
+    def test_symlink_escaping_sandbox_blocked(self, tmp_path):
+        root = tmp_path / "sandbox"
+        root.mkdir()
+        (tmp_path / "secret.txt").write_text("x")
+        (root / "link.txt").symlink_to(tmp_path / "secret.txt")
+        assert not _within_roots(str(root / "link.txt"), [str(root)])
+        assert _within_roots(str(root / "new_file.txt"), [str(root)])
 
     def test_path_arguments_inside_sandbox_forwarded(self, client):
         mocks = _MockBackends({_FS_URL: lambda req: _result(req["id"])})

@@ -57,8 +57,9 @@ if not logger.handlers:
 # ---------------------------------------------------------------------------
 _DEFAULT_POLICY = pathlib.Path(__file__).resolve().parent.parent / "config" / "policy.yaml"
 
-# Heuristic inspection patterns (Layer 1)
-TRAVERSAL_PATTERN = r"(\.\./|\.\.\\|/etc/|~/\.ssh|~/\.env)"
+# Heuristic inspection patterns (Layer 1).  Path traversal is decided by the
+# canonicalizing sandbox check, not by matching "../" in the raw arguments.
+SENSITIVE_PATH_PATTERN = r"(/etc/|~/\.ssh|~/\.env)"
 SHELL_INJECTION = r"(;|\||\&\&|\bcurl\b|\bbash\b)"
 AWS_KEY_PATTERN = r"(AKIA[0-9A-Z]{16})"
 
@@ -197,17 +198,17 @@ def create_app(
             return _jsonrpc_error(request_id, -32602, str(exc), data=exc.data, status=200)
 
         # -- Layer 1: Heuristic & Scope Boundary inspection -------------
-        is_traversal = bool(re.search(TRAVERSAL_PATTERN, arg_string))
+        is_sensitive_path = bool(re.search(SENSITIVE_PATH_PATTERN, arg_string))
         is_shell = bool(re.search(SHELL_INJECTION, arg_string))
         is_aws_key = bool(re.search(AWS_KEY_PATTERN, arg_string))
 
         # Scope boundary check: path arguments must stay inside the backend sandbox
         is_out_of_sandbox = _registry.find_sandbox_violation(resolved, arguments) is not None
 
-        if is_traversal or is_shell or is_aws_key or is_out_of_sandbox:
+        if is_sensitive_path or is_shell or is_aws_key or is_out_of_sandbox:
             reason = (
                 "Malicious pattern detected"
-                if (is_traversal or is_shell or is_aws_key)
+                if (is_sensitive_path or is_shell or is_aws_key)
                 else "Path outside sandbox boundary"
             )
             logger.warning(
