@@ -10,6 +10,12 @@ DFA *before* any downstream forwarding occurs.  Additionally intercepts
 ``tools/list`` to multiplex tool schemas from every registered backend,
 namespacing each tool (``fs__read_file``) and dynamically classifying
 previously-unseen tools.
+
+Every frame emits structured ``ProxyEvent`` telemetry at the
+BEFORE/AFTER_TOOL_LIST and BEFORE/AFTER_TOOL_CALL checkpoints.  Calls
+within one session are serialized end-to-end (DFA check -> forward ->
+response scan) so a call cannot slip past a taint that an in-flight
+response is about to latch.
 """
 
 from __future__ import annotations
@@ -21,15 +27,17 @@ import os
 import pathlib
 import re
 import sys
-from typing import Any
+import weakref
+from typing import Any, Callable
 
 import httpx
 import uvicorn
 from fastapi import FastAPI, Request, Response
 
+from src.engine.events import Checkpoint, Decision, EventCollector, ProxyEvent
 from src.engine.ingest_scanner import scan_payload_for_untrusted_directives
 from src.engine.registry import BackendRegistry, ToolResolutionError
-from src.engine.state_machine import SessionGraphManager
+from src.engine.state_machine import DEFAULT_SESSION_TTL, SessionGraphManager, describe_source
 from src.models.policy import PolicyConfig, ToolState
 
 # ---------------------------------------------------------------------------
@@ -64,6 +72,7 @@ def create_app(
     downstream_url: str | None = None,
     fetch_downstream_url: str | None = None,
     backend_urls: dict[str, str] | None = None,
+    event_collector: EventCollector | None = None,
 ) -> FastAPI:
     """Factory function for the FastAPI application.
 
@@ -78,7 +87,11 @@ def create_app(
     # Resolve configuration
     policy_path = os.getenv("POLICY_PATH", str(_DEFAULT_POLICY))
     _policy = policy_config or PolicyConfig.from_yaml(policy_path)
-    _engine = graph_manager or SessionGraphManager(_policy)
+    _engine = graph_manager or SessionGraphManager(
+        _policy,
+        session_ttl=float(os.getenv("SESSION_TTL_SECONDS", DEFAULT_SESSION_TTL)),
+    )
+    _events = event_collector or EventCollector()
 
     url_overrides = dict(backend_urls or {})
     if downstream_url and _policy.default_backend:
@@ -91,6 +104,38 @@ def create_app(
     app.state.policy = _policy
     app.state.engine = _engine
     app.state.registry = _registry
+    app.state.events = _events
+
+    # One asyncio.Lock per in-flight session; entries vanish once unused.
+    _session_gates: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+
+    def _session_gate(session_id: str) -> asyncio.Lock:
+        gate = _session_gates.get(session_id)
+        if gate is None:
+            gate = asyncio.Lock()
+            _session_gates[session_id] = gate
+        return gate
+
+    def _emit(
+        checkpoint: Checkpoint,
+        session_id: str,
+        tool_name: str | None,
+        decision: Decision,
+        request_id: Any,
+        current_state: str | None = None,
+        **details: Any,
+    ) -> None:
+        _events.emit(
+            ProxyEvent(
+                session_id=session_id,
+                event_type=checkpoint,
+                tool_name=tool_name,
+                current_state=current_state or _engine.peek_state(session_id).value,
+                decision=decision,
+                request_id=request_id,
+                details=details,
+            )
+        )
 
     # -----------------------------------------------------------------------
     # POST /mcp  –  main enforcement endpoint
@@ -107,11 +152,12 @@ def create_app(
 
         request_id = payload.get("id")
         method = payload.get("method", "")
-        params = payload.get("params", {})
+        session_id = _session_id(request)
 
         # -- tools/list: multiplex across backends & auto-classify ---------
         if method == "tools/list":
-            return await _handle_tools_list(payload, _registry)
+            _emit(Checkpoint.BEFORE_TOOL_LIST, session_id, None, Decision.ALLOW, request_id)
+            return await _handle_tools_list(payload, _registry, session_id, _emit)
 
         # -- Non-tool-call requests pass through to the default backend ----
         if method != "tools/call":
@@ -120,13 +166,25 @@ def create_app(
                 return _jsonrpc_error(request_id, -32601, "No backend registered", status=200)
             return await _forward(payload, _registry.url(default_ns))
 
-        # -- Extract session & tool context ------------------------------
-        session_id = request.headers.get(
-            "X-Session-ID", request.client.host if request.client else "unknown"
-        )
+        # -- Serialize this session's calls across check -> forward -> scan --
+        # Without this, a second call evaluated while a scanned response is
+        # still in flight would miss the taint that response is about to latch.
+        async with _session_gate(session_id):
+            return await _handle_tool_call(payload, session_id)
+
+    async def _handle_tool_call(payload: dict[str, Any], session_id: str) -> Response:
+        """Run one ``tools/call`` through the BEFORE/AFTER_TOOL_CALL checkpoints."""
+        request_id = payload.get("id")
+        params = payload.get("params", {})
         tool_name: str = params.get("name", "")
         arguments: dict = params.get("arguments", {})
         arg_string = " ".join(str(v) for v in arguments.values())
+
+        def block(layer: str, reason: str, tool: str = tool_name, **details: Any) -> None:
+            _emit(
+                Checkpoint.BEFORE_TOOL_CALL, session_id, tool, Decision.BLOCK, request_id,
+                layer=layer, reason=reason, **details,
+            )
 
         # -- Resolve namespaced / bare tool name to a backend --------------
         try:
@@ -135,6 +193,7 @@ def create_app(
             logger.warning(
                 f"[SECURITY BLOCKED - ROUTING] Session '{session_id}' called ambiguous tool '{tool_name}'"
             )
+            block("routing", str(exc))
             return _jsonrpc_error(request_id, -32602, str(exc), data=exc.data, status=200)
 
         # -- Layer 1: Heuristic & Scope Boundary inspection -------------
@@ -154,6 +213,7 @@ def create_app(
             logger.warning(
                 f"[SECURITY BLOCKED - HEURISTIC] Intercepted '{resolved.canonical}' ({reason}) with args {arguments} from session '{session_id}'"
             )
+            block("heuristic", reason, resolved.canonical)
             return _jsonrpc_error(
                 request_id,
                 -32602,
@@ -168,6 +228,10 @@ def create_app(
             logger.warning(
                 f"[SECURITY BLOCKED - DFA INVARIANT] Session '{session_id}' denied transition: "
                 f"tool='{resolved.canonical}', state='{meta['from_state']}' -> '{meta['to_state']}', reason='{reason}'"
+            )
+            block(
+                "dfa", reason, resolved.canonical,
+                current_state=meta["from_state"], target_state=meta["to_state"], status=meta["status"],
             )
             return _jsonrpc_error(
                 request_id,
@@ -184,10 +248,22 @@ def create_app(
 
         # -- Dispatch to the owning backend under its upstream tool name ---
         if resolved.namespace is None:
+            block("routing", f"No backend serves tool '{tool_name}'", resolved.canonical)
             return _jsonrpc_error(
                 request_id, -32601, f"No backend serves tool '{tool_name}'", status=200
             )
         target_backend = _registry.url(resolved.namespace)
+        _emit(
+            Checkpoint.BEFORE_TOOL_CALL,
+            session_id,
+            resolved.canonical,
+            Decision.MUTATE if resolved.upstream != tool_name else Decision.ALLOW,
+            request_id,
+            current_state=meta["from_state"],
+            target_state=meta["to_state"],
+            backend=resolved.namespace,
+            upstream_tool=resolved.upstream,
+        )
         logger.info(
             f"[MULTI-BACKEND DISPATCH] Routing tool='{resolved.canonical}' for session='{session_id}' "
             f"-> {resolved.namespace} ({target_backend})"
@@ -198,7 +274,9 @@ def create_app(
         # -- Layer 3: Dynamic Ingest Scanner (response inspection) --------
         # For content-returning tools on backends with scan_responses enabled,
         # scan the response payload for imperative prompt-injection directives.
+        after: dict[str, Any] = {"scanned": False, "tainted": False, "status_code": response.status_code}
         if _registry.should_scan(resolved, ToolState(meta["to_state"])):
+            after["scanned"] = True
             try:
                 resp_body = json.loads(response.body)
                 # Extract text from MCP result.content[].text
@@ -215,15 +293,56 @@ def create_app(
                     scan_result = scan_payload_for_untrusted_directives(full_text)
                     if scan_result.is_untrusted:
                         # Retroactively taint the session with sticky latch
-                        _engine.taint_session(session_id, ToolState.UNTRUSTED_INGEST)
+                        taint_source = describe_source(resolved.canonical, arguments)
+                        _engine.taint_session(
+                            session_id,
+                            ToolState.UNTRUSTED_INGEST,
+                            taint_source=taint_source,
+                            trigger_pattern=scan_result.pattern_id,
+                            reason=scan_result.reason,
+                        )
+                        after.update(
+                            tainted=True,
+                            taint_source=taint_source,
+                            trigger_pattern=scan_result.pattern_id,
+                            reason=scan_result.reason,
+                        )
                         logger.warning(
                             f"[DYNAMIC INGEST SCANNER] Session '{session_id}' tainted "
                             f"with UNTRUSTED_INGEST from tool '{resolved.canonical}'. Reason: {scan_result.reason}"
                         )
-            except Exception:
-                pass  # Non-parseable response — leave session state as-is
+            except Exception as exc:
+                # Non-parseable response — leave session state as-is
+                after["scan_error"] = type(exc).__name__
 
+        _emit(Checkpoint.AFTER_TOOL_CALL, session_id, resolved.canonical, Decision.ALLOW, request_id, **after)
         return response
+
+    # -----------------------------------------------------------------------
+    # GET /session/{session_id}  –  session context (trajectory & taint vector)
+    # -----------------------------------------------------------------------
+    @app.get("/session/{session_id}")
+    async def session_context(session_id: str) -> Response:
+        """Return the session's state history and taint attribution."""
+        context = _engine.get_session_context(session_id)
+        if context is None:
+            return Response(
+                content=json.dumps({"error": f"Unknown or expired session '{session_id}'"}),
+                status_code=404,
+                media_type="application/json",
+            )
+        return Response(content=json.dumps(context), media_type="application/json")
+
+    # -----------------------------------------------------------------------
+    # GET /session/{session_id}/events  –  checkpoint telemetry
+    # -----------------------------------------------------------------------
+    @app.get("/session/{session_id}/events")
+    async def session_events(session_id: str) -> dict:
+        """Return the checkpoint events recorded for a session."""
+        return {
+            "session_id": session_id,
+            "events": [e.to_dict() for e in _events.events(session_id)],
+        }
 
     # -----------------------------------------------------------------------
     # GET /session/{session_id}/graph  –  Mermaid diagram export
@@ -240,6 +359,17 @@ def create_app(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _session_id(request: Request) -> str:
+    """Session key: X-Session-ID, else the client host.
+
+    The host (not host:port) is deliberate: keying on the ephemeral port
+    would let a client shed its taint latch simply by reconnecting.
+    """
+    return request.headers.get(
+        "X-Session-ID", request.client.host if request.client else "unknown"
+    )
+
 
 def _jsonrpc_error(
     request_id: Any,
@@ -282,7 +412,12 @@ async def _forward(payload: dict, downstream_url: str) -> Response:
             )
 
 
-async def _handle_tools_list(payload: dict, registry: BackendRegistry) -> Response:
+async def _handle_tools_list(
+    payload: dict,
+    registry: BackendRegistry,
+    session_id: str,
+    emit: Callable[..., None],
+) -> Response:
     """Multiplex ``tools/list`` across all registered backends and auto-classify.
 
     Queries every backend concurrently, namespaces each advertised tool as
@@ -324,6 +459,21 @@ async def _handle_tools_list(payload: dict, registry: BackendRegistry) -> Respon
             if namespaced_tool["name"] not in seen_names:
                 seen_names.add(namespaced_tool["name"])
                 merged_tools.append(namespaced_tool)
+                # Quarantined tools stay listed, but every call to them is blocked
+                state = registry.resolve_state(namespaced_tool["name"])
+                quarantined = state is ToolState.UNKNOWN
+                emit(
+                    Checkpoint.AFTER_TOOL_LIST,
+                    session_id,
+                    namespaced_tool["name"],
+                    Decision.BLOCK if quarantined else Decision.MUTATE,
+                    payload.get("id"),
+                    backend=namespace,
+                    upstream_tool=tool["name"],
+                    classified_state=state.value,
+                    quarantined=quarantined,
+                    description=str(tool.get("description", ""))[:200],
+                )
 
     if not any_success:
         return _jsonrpc_error(

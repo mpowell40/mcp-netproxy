@@ -101,6 +101,10 @@ class BackendRegistry:
             return ResolvedTool(tool_name, namespaced(owners[0], tool_name), tool_name, owners[0])
         return ResolvedTool(tool_name, tool_name, tool_name, self.default_namespace)
 
+    def resolve_state(self, tool_name: str) -> ToolState:
+        """DFA state the policy currently assigns to *tool_name*."""
+        return self._policy.resolve_state(tool_name)
+
     # -- discovery -------------------------------------------------------
 
     def register_discovered(self, namespace: str, tool: dict[str, Any]) -> dict[str, Any]:

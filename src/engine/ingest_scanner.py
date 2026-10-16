@@ -17,6 +17,7 @@ class ScanResult(NamedTuple):
     """Result of scanning a payload for untrusted directives."""
     is_untrusted: bool
     reason: str
+    pattern_id: str = ""  # e.g. "HEADER_DIRECTIVE"; empty when clean
 
 
 # ---------------------------------------------------------------------------
@@ -55,13 +56,13 @@ _PATH_INJECTION = re.compile(
     re.IGNORECASE,
 )
 
-# All patterns with their human-readable reason labels
-_PATTERNS: list[tuple[re.Pattern, str]] = [
-    (_HEADER_DIRECTIVE, "Header directive hijacking detected"),
-    (_AGENT_TARGET_HEADER, "Agent-targeted social engineering header detected"),
-    (_IMPERATIVE_ACTION, "Imperative action verb commanding agent behavior"),
-    (_MUTATION_TARGET, "Mutation target directing file write operation"),
-    (_PATH_INJECTION, "Direct file path injection command detected"),
+# All patterns with their stable identifiers and human-readable reason labels
+_PATTERNS: list[tuple[re.Pattern, str, str]] = [
+    (_HEADER_DIRECTIVE, "HEADER_DIRECTIVE", "Header directive hijacking detected"),
+    (_AGENT_TARGET_HEADER, "AGENT_TARGET_HEADER", "Agent-targeted social engineering header detected"),
+    (_IMPERATIVE_ACTION, "IMPERATIVE_ACTION", "Imperative action verb commanding agent behavior"),
+    (_MUTATION_TARGET, "MUTATION_TARGET", "Mutation target directing file write operation"),
+    (_PATH_INJECTION, "PATH_INJECTION", "Direct file path injection command detected"),
 ]
 
 
@@ -76,7 +77,7 @@ def scan_payload_for_untrusted_directives(text: str) -> ScanResult:
         text: The raw text content returned by a file-read tool.
 
     Returns:
-        A ``ScanResult(is_untrusted, reason)`` tuple.
+        A ``ScanResult(is_untrusted, reason, pattern_id)`` tuple.
         ``is_untrusted`` is ``True`` when at least one directive pattern
         matches.  ``reason`` explains why the payload was flagged, or
         indicates the payload is passive/clean.
@@ -84,9 +85,9 @@ def scan_payload_for_untrusted_directives(text: str) -> ScanResult:
     if not text or not text.strip():
         return ScanResult(False, "Empty payload")
 
-    for pattern, reason in _PATTERNS:
+    for pattern, pattern_id, reason in _PATTERNS:
         if pattern.search(text):
-            return ScanResult(True, reason)
+            return ScanResult(True, reason, pattern_id)
 
     return ScanResult(False, "Passive data / configuration")
 
