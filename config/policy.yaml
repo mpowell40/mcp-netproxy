@@ -91,6 +91,7 @@ allowed_transitions:
   START:
     - DISCOVERY
     - LOCAL_READ
+    - LOCAL_WRITE  # writing first is a normal session (create, rename, generate)
     - UNTRUSTED_INGEST
 
   DISCOVERY:
