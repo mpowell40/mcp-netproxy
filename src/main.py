@@ -200,8 +200,7 @@ def create_app(
         request_id = payload.get("id")
         params = payload.get("params", {})
         tool_name: str = params.get("name", "")
-        arguments: dict = params.get("arguments", {})
-        arg_string = " ".join(str(v) for v in arguments.values())
+        arguments: Any = params.get("arguments", {})
 
         def block(layer: str, reason: str, tool: str = tool_name, **details: Any) -> None:
             _emit(
@@ -218,6 +217,21 @@ def create_app(
             )
             block("routing", str(exc))
             return _jsonrpc_error(request_id, -32602, str(exc), data=exc.data, status=200)
+
+        # -- Layer 1: Argument validation (types and size limits) -----------
+        argument_violation = _registry.find_argument_violation(resolved, arguments)
+        if argument_violation is not None:
+            logger.warning(
+                f"[SECURITY BLOCKED - INPUT] Intercepted '{resolved.canonical}' ({argument_violation}) from session '{session_id}'"
+            )
+            block("heuristic", f"Invalid arguments: {argument_violation}", resolved.canonical)
+            return _jsonrpc_error(
+                request_id,
+                -32602,
+                f"Policy Violation: Invalid arguments: {argument_violation} blocked by proxy",
+                status=200,
+            )
+        arg_string = " ".join(str(v) for v in arguments.values())
 
         # -- Layer 1: Heuristic & Scope Boundary inspection -------------
         is_sensitive_path = bool(re.search(SENSITIVE_PATH_PATTERN, arg_string))

@@ -58,6 +58,14 @@ class ForbiddenInvariant(BaseModel):
     unless_visited: list[ToolState] = Field(default_factory=list)
 
 
+class ArgumentLimits(BaseModel):
+    """Size limits applied to every tool call's arguments (Layer 1)."""
+
+    max_path_length: int = 4096  # PATH_MAX on Linux
+    max_url_length: int = 8192
+    max_total_bytes: int = 1024 * 1024
+
+
 class EgressConfig(BaseModel):
     """Outbound URL policy for a fetch-style backend.
 
@@ -126,6 +134,7 @@ class PolicyConfig(BaseModel):
     forbidden_invariants: list[ForbiddenInvariant] = Field(default_factory=list)
     backends: dict[str, BackendConfig] = Field(default_factory=dict)
     default_backend: str | None = None
+    argument_limits: ArgumentLimits = Field(default_factory=ArgumentLimits)
 
     # Names declared at the top level of ``tool_mappings``; never replaced
     # or withdrawn by backend aliasing.

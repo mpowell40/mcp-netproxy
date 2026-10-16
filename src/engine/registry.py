@@ -15,6 +15,7 @@ import posixpath
 from dataclasses import dataclass
 from typing import Any
 
+from src.engine.arguments import find_argument_violation
 from src.engine.classifier import classify_tool
 from src.engine.egress import EgressPolicy
 from src.models.policy import BackendConfig, PolicyConfig, ToolState, namespaced
@@ -59,6 +60,7 @@ class BackendRegistry:
         overrides = url_overrides or {}
         self._urls: dict[str, str] = {}
         self._egress: dict[str, EgressPolicy | None] = {}
+        self._schemas: dict[str, dict[str, Any]] = {}  # namespaced tool -> inputSchema
         for namespace, backend in policy.backends.items():
             env_url = os.getenv(backend.url_env) if backend.url_env else None
             self._urls[namespace] = overrides.get(namespace) or env_url or backend.url
@@ -120,6 +122,9 @@ class BackendRegistry:
         """
         tool_name = tool["name"]
         key = namespaced(namespace, tool_name)
+        schema = tool.get("inputSchema")
+        if isinstance(schema, dict):
+            self._schemas[key] = schema
         if key not in self._policy.tool_mappings:
             state = classify_tool(
                 name=tool_name,
@@ -139,6 +144,17 @@ class BackendRegistry:
         return {**tool, "name": key}
 
     # -- enforcement helpers --------------------------------------------
+
+    def find_argument_violation(self, resolved: ResolvedTool, arguments: Any) -> str | None:
+        """Return why the call's arguments are malformed or oversized, if they are."""
+        backend = self.backend(resolved.namespace) if resolved.namespace is not None else None
+        return find_argument_violation(
+            arguments,
+            self._schemas.get(resolved.canonical),
+            backend.path_arguments if backend else [],
+            backend.url_arguments if backend and backend.egress is not None else [],
+            self._policy.argument_limits,
+        )
 
     def find_sandbox_violation(self, resolved: ResolvedTool, arguments: dict[str, Any]) -> str | None:
         """Return the first path argument outside the backend sandbox, if any."""

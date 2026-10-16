@@ -97,6 +97,17 @@ tool_mappings:
   upload_file: NETWORK_EGRESS
   send_email: NETWORK_EGRESS
 
+# ----------------------------------------------------------------------------
+# Layer 1 argument limits (rejected before forwarding)
+# ----------------------------------------------------------------------------
+# Arguments must be an object; path/URL arguments must be strings (or lists
+# of strings); values must match the tool's inputSchema types once the proxy
+# has seen it via tools/list.
+argument_limits:
+  max_path_length: 4096       # PATH_MAX
+  max_url_length: 8192
+  max_total_bytes: 1048576    # serialized arguments, 1 MiB
+
 # Directed edges in the DFA.  from_state -> [to_states]
 # Any transition NOT listed here is denied by default.
 allowed_transitions:
