@@ -98,9 +98,13 @@ def create_app(
                 raise RuntimeError(f"EGRESS_GUARD_PORT set but backend '{guard_ns}' has no egress policy")
             server = await EgressGuard(egress).start("0.0.0.0", int(guard_port))
             logger.info(f"[EGRESS GUARD] Enforcing '{guard_ns}' egress policy on port {guard_port}")
+        # One pooled client for all backend traffic (keep-alive connections).
+        app.state.http_client = httpx.AsyncClient()
         try:
             yield
         finally:
+            await app.state.http_client.aclose()
+            app.state.http_client = None
             if server is not None:
                 server.close()
                 await server.wait_closed()
@@ -124,6 +128,7 @@ def create_app(
     _registry = BackendRegistry(_policy, url_overrides)
 
     # Store on app.state for access in tests / introspection
+    app.state.http_client = None  # set for the app's lifetime by lifespan
     app.state.policy = _policy
     app.state.engine = _engine
     app.state.registry = _registry
@@ -180,14 +185,14 @@ def create_app(
         # -- tools/list: multiplex across backends & auto-classify ---------
         if method == "tools/list":
             _emit(Checkpoint.BEFORE_TOOL_LIST, session_id, None, Decision.ALLOW, request_id)
-            return await _handle_tools_list(payload, _registry, session_id, _emit)
+            return await _handle_tools_list(payload, _registry, session_id, _emit, app.state.http_client)
 
         # -- Non-tool-call requests pass through to the default backend ----
         if method != "tools/call":
             default_ns = _registry.default_namespace
             if default_ns is None:
                 return _jsonrpc_error(request_id, -32601, "No backend registered", status=200)
-            return await _forward(payload, _registry.url(default_ns))
+            return await _forward(payload, _registry.url(default_ns), app.state.http_client)
 
         # -- Serialize this session's calls across check -> forward -> scan --
         # Without this, a second call evaluated while a scanned response is
@@ -320,7 +325,7 @@ def create_app(
             f"-> {resolved.namespace} ({target_backend})"
         )
         upstream_payload = {**payload, "params": {**params, "name": resolved.upstream}}
-        response = await _forward(upstream_payload, target_backend)
+        response = await _forward(upstream_payload, target_backend, app.state.http_client)
 
         # -- Layer 3: Dynamic Ingest Scanner (response inspection) --------
         # For content-returning tools on backends with scan_responses enabled,
@@ -444,9 +449,19 @@ def _jsonrpc_error(
     )
 
 
-async def _forward(payload: dict, downstream_url: str) -> Response:
+@contextlib.asynccontextmanager
+async def _backend_client(shared: httpx.AsyncClient | None):
+    """The app's pooled client, or a one-off client when no lifespan ran (tests)."""
+    if shared is not None:
+        yield shared
+    else:
+        async with httpx.AsyncClient() as client:
+            yield client
+
+
+async def _forward(payload: dict, downstream_url: str, shared: httpx.AsyncClient | None = None) -> Response:
     """Forward a JSON-RPC payload to the specified downstream MCP server."""
-    async with httpx.AsyncClient() as client:
+    async with _backend_client(shared) as client:
         try:
             res = await client.post(downstream_url, json=payload, timeout=10.0)
             return Response(
@@ -468,6 +483,7 @@ async def _handle_tools_list(
     registry: BackendRegistry,
     session_id: str,
     emit: Callable[..., None],
+    shared: httpx.AsyncClient | None = None,
 ) -> Response:
     """Multiplex ``tools/list`` across all registered backends and auto-classify.
 
@@ -484,7 +500,7 @@ async def _handle_tools_list(
     last_error: Exception | None = None
     raw_fallback_response: httpx.Response | None = None
 
-    async with httpx.AsyncClient() as client:
+    async with _backend_client(shared) as client:
         results = await asyncio.gather(
             *(client.post(registry.url(ns), json=payload, timeout=5.0) for ns in namespaces),
             return_exceptions=True,
