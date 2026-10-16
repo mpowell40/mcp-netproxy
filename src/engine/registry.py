@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from src.engine.classifier import classify_tool
+from src.engine.egress import EgressPolicy
 from src.models.policy import BackendConfig, PolicyConfig, ToolState, namespaced
 
 logger = logging.getLogger("mcp-netproxy")
@@ -57,6 +58,7 @@ class BackendRegistry:
         self._policy = policy
         overrides = url_overrides or {}
         self._urls: dict[str, str] = {}
+        self._egress: dict[str, EgressPolicy | None] = {}
         for namespace, backend in policy.backends.items():
             env_url = os.getenv(backend.url_env) if backend.url_env else None
             self._urls[namespace] = overrides.get(namespace) or env_url or backend.url
@@ -153,6 +155,27 @@ class BackendRegistry:
                     continue
                 if not _within_roots(str(candidate), backend.sandbox_roots):
                     return str(candidate)
+        return None
+
+    def egress_policy(self, namespace: str) -> EgressPolicy | None:
+        """The backend's outbound URL policy, or None if it has none."""
+        if namespace not in self._egress:
+            config = self.backend(namespace).egress
+            self._egress[namespace] = EgressPolicy(config) if config is not None else None
+        return self._egress[namespace]
+
+    async def find_egress_violation(self, resolved: ResolvedTool, arguments: dict[str, Any]) -> str | None:
+        """Return why a URL argument may not be fetched, if any."""
+        if resolved.namespace is None:
+            return None
+        policy = self.egress_policy(resolved.namespace)
+        if policy is None:
+            return None
+        for arg_name in self.backend(resolved.namespace).url_arguments:
+            if arg_name in arguments:
+                verdict = await policy.check(arguments[arg_name])
+                if not verdict.allowed:
+                    return verdict.reason
         return None
 
     def should_scan(self, resolved: ResolvedTool, state: ToolState) -> bool:

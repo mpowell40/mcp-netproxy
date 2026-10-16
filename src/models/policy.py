@@ -58,6 +58,22 @@ class ForbiddenInvariant(BaseModel):
     unless_visited: list[ToolState] = Field(default_factory=list)
 
 
+class EgressConfig(BaseModel):
+    """Outbound URL policy for a fetch-style backend.
+
+    Attributes:
+        schemes: URL schemes that may be fetched.
+        allowed_hosts: Exact hostnames that may be fetched.
+        private_hosts: Allowlisted hosts that may resolve to private
+            (RFC 1918 / ULA) addresses, e.g. an internal fixture server.
+            Loopback, link-local and metadata addresses are never allowed.
+    """
+
+    schemes: list[str] = Field(default_factory=lambda: ["http", "https"])
+    allowed_hosts: list[str] = Field(default_factory=list)
+    private_hosts: list[str] = Field(default_factory=list)
+
+
 class BackendConfig(BaseModel):
     """A downstream MCP server registered behind the proxy.
 
@@ -73,6 +89,8 @@ class BackendConfig(BaseModel):
             checked against ``sandbox_roots``.
         scan_responses: Run the ingest scanner over LOCAL_READ /
             UNTRUSTED_INGEST / NETWORK_EGRESS responses from this backend.
+        url_arguments: Argument names checked against ``egress``.
+        egress: Outbound URL policy; None disables the URL check.
         tools: Explicit upstream-tool-name -> ToolState mappings.
     """
 
@@ -82,6 +100,8 @@ class BackendConfig(BaseModel):
     sandbox_roots: list[str] = Field(default_factory=list)
     path_arguments: list[str] = Field(default_factory=lambda: ["path"])
     scan_responses: bool = False
+    url_arguments: list[str] = Field(default_factory=lambda: ["url"])
+    egress: EgressConfig | None = None
     tools: dict[str, ToolState] = Field(default_factory=dict)
 
 

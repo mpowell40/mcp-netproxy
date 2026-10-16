@@ -19,8 +19,14 @@
 #                   classified outside this set are quarantined as UNKNOWN
 #   sandbox_roots   prefixes that every path argument must stay within
 #   path_arguments  argument names (string or list) checked against roots
-#   scan_responses  run the ingest scanner on LOCAL_READ/UNTRUSTED_INGEST
-#                   responses (sticky taint on injection directives)
+#   scan_responses  run the ingest scanner on LOCAL_READ/UNTRUSTED_INGEST/
+#                   NETWORK_EGRESS responses (sticky taint on injection directives)
+#   url_arguments   argument names checked against egress (default: [url])
+#   egress          outbound URL policy: schemes, exact-host allowlist, and
+#                   private_hosts (allowlisted hosts that may resolve to
+#                   private addresses).  Loopback, link-local and metadata
+#                   addresses are always refused.  Also enforced on every
+#                   request (incl. redirects) by the egress guard.
 #   tools           explicit upstream tool name -> DFA state mappings
 default_backend: fs
 
@@ -55,6 +61,12 @@ backends:
     url_env: MCP_FETCH_URL
     capabilities: [LOCAL_READ, NETWORK_EGRESS, UNTRUSTED_INGEST]
     scan_responses: true
+    egress:
+      schemes: [http, https]
+      allowed_hosts:
+        - fetch-backend      # testbed fixture server
+      private_hosts:
+        - fetch-backend      # internal Docker address
     tools:
       # Outbound request: the URL itself can carry data off-host, so fetch
       # is egress.  Its response is still external content and is scanned;

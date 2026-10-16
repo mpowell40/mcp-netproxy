@@ -21,6 +21,7 @@ response is about to latch.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -34,6 +35,7 @@ import httpx
 import uvicorn
 from fastapi import FastAPI, Request, Response
 
+from src.engine.egress import EgressGuard
 from src.engine.events import Checkpoint, Decision, EventCollector, ProxyEvent
 from src.engine.ingest_scanner import scan_payload_for_untrusted_directives
 from src.engine.registry import BackendRegistry, ToolResolutionError
@@ -83,7 +85,27 @@ def create_app(
     ``fetch_downstream_url`` are kept as shorthands for overriding the
     default backend and the ``web`` backend respectively.
     """
-    app = FastAPI(title="MCP Enforcement Proxy (Multi-Backend Behavioral DFA)")
+    @contextlib.asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # Egress guard: forward proxy that the fetch backend sends every
+        # request through (--proxy-url), so redirects are re-validated too.
+        guard_port = os.getenv("EGRESS_GUARD_PORT")
+        guard_ns = os.getenv("EGRESS_GUARD_BACKEND", _FETCH_NAMESPACE)
+        server = None
+        if guard_port and guard_ns in _policy.backends:
+            egress = _registry.egress_policy(guard_ns)
+            if egress is None:
+                raise RuntimeError(f"EGRESS_GUARD_PORT set but backend '{guard_ns}' has no egress policy")
+            server = await EgressGuard(egress).start("0.0.0.0", int(guard_port))
+            logger.info(f"[EGRESS GUARD] Enforcing '{guard_ns}' egress policy on port {guard_port}")
+        try:
+            yield
+        finally:
+            if server is not None:
+                server.close()
+                await server.wait_closed()
+
+    app = FastAPI(title="MCP Enforcement Proxy (Multi-Backend Behavioral DFA)", lifespan=lifespan)
 
     # Resolve configuration
     policy_path = os.getenv("POLICY_PATH", str(_DEFAULT_POLICY))
@@ -204,6 +226,20 @@ def create_app(
 
         # Scope boundary check: path arguments must stay inside the backend sandbox
         is_out_of_sandbox = _registry.find_sandbox_violation(resolved, arguments) is not None
+
+        # Egress check: URL arguments must satisfy the backend's URL policy
+        egress_violation = await _registry.find_egress_violation(resolved, arguments)
+        if egress_violation is not None:
+            logger.warning(
+                f"[SECURITY BLOCKED - EGRESS] Intercepted '{resolved.canonical}' ({egress_violation}) from session '{session_id}'"
+            )
+            block("heuristic", f"Egress policy: {egress_violation}", resolved.canonical)
+            return _jsonrpc_error(
+                request_id,
+                -32602,
+                f"Policy Violation: Egress policy: {egress_violation} blocked by proxy",
+                status=200,
+            )
 
         if is_sensitive_path or is_shell or is_aws_key or is_out_of_sandbox:
             reason = (

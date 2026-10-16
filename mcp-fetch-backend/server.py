@@ -50,12 +50,17 @@ async def lifespan(app: FastAPI):
     global proc, init_result_cache
     print("Starting official MCP Fetch server (mcp-server-fetch)...", flush=True)
 
+    # Route every outbound request through the proxy's egress guard when set,
+    # so redirects are re-validated against the egress policy.
+    proxy_args = ["--proxy-url", os.environ["EGRESS_PROXY_URL"]] if os.environ.get("EGRESS_PROXY_URL") else []
+
     proc = await asyncio.create_subprocess_exec(
         sys.executable,
         "-m",
         "mcp_server_fetch",
         "--ignore-robots-txt",
         "--allow-private-ips",
+        *proxy_args,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
