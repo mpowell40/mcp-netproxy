@@ -92,3 +92,10 @@ sent even after a block, so the outcome checks see what actually got through.
   path measured inside the container). On a native Linux mount this costs
   microseconds, so overhead figures here overstate production cost.
   Run-to-run variation is tens of milliseconds; compare medians.
+
+## Policy freeze
+
+The holdout set was run once, on commit `8c566d3` (`eval/runs/final/`).
+The policy and enforcement code are frozen at that commit for this
+evaluation: no changes are made in response to holdout results. Any later
+policy change needs a new, unseen holdout set before its numbers are reported.
