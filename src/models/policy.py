@@ -72,7 +72,7 @@ class BackendConfig(BaseModel):
         path_arguments: Argument names (string or list of strings) that are
             checked against ``sandbox_roots``.
         scan_responses: Run the ingest scanner over LOCAL_READ /
-            UNTRUSTED_INGEST responses from this backend.
+            UNTRUSTED_INGEST / NETWORK_EGRESS responses from this backend.
         tools: Explicit upstream-tool-name -> ToolState mappings.
     """
 

@@ -53,12 +53,13 @@ backends:
   web:  # mcp-server-fetch
     url: http://fetch-backend:9001/mcp
     url_env: MCP_FETCH_URL
-    capabilities: [LOCAL_READ, UNTRUSTED_INGEST]
+    capabilities: [LOCAL_READ, NETWORK_EGRESS, UNTRUSTED_INGEST]
     scan_responses: true
     tools:
-      # Remote content retrieval; taint is applied dynamically by the
-      # ingest scanner rather than statically on every fetch.
-      fetch: LOCAL_READ
+      # Outbound request: the URL itself can carry data off-host, so fetch
+      # is egress.  Its response is still external content and is scanned;
+      # taint is applied by the ingest scanner rather than on every fetch.
+      fetch: NETWORK_EGRESS
 
 # ----------------------------------------------------------------------------
 # Global tool mappings

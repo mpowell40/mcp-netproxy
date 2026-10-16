@@ -217,7 +217,7 @@ class TestClassifyTool:
     def test_explicit_policy_wins(self, policy):
         """Tools already in policy.tool_mappings bypass heuristics."""
         result = classify_tool("fetch", policy=policy)
-        assert result == ToolState.LOCAL_READ  # From policy (overrides heuristic UNTRUSTED_INGEST)
+        assert result == ToolState.NETWORK_EGRESS  # From policy (overrides heuristic UNTRUSTED_INGEST)
 
     def test_policy_overrides_heuristic(self, policy):
         # read_file is mapped in policy — should return from policy

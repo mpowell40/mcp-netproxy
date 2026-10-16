@@ -20,7 +20,8 @@ from src.models.policy import BackendConfig, PolicyConfig, ToolState, namespaced
 logger = logging.getLogger("mcp-netproxy")
 
 # DFA states whose responses carry ingested content worth scanning
-_SCANNED_STATES = {ToolState.LOCAL_READ, ToolState.UNTRUSTED_INGEST}
+# (NETWORK_EGRESS: an outbound request returns external content)
+_SCANNED_STATES = {ToolState.LOCAL_READ, ToolState.UNTRUSTED_INGEST, ToolState.NETWORK_EGRESS}
 
 
 class ToolResolutionError(Exception):
