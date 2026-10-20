@@ -1,0 +1,13 @@
+id: LA01
+category: live_boundary
+kind: attack
+description: Fetch a reachable host that is not allowlisted.
+holdout: false
+calls:
+- tool: fetch
+  args:
+    url: https://example.com/
+expected_verdict: block
+block_at: 0
+must_not_return:
+- Example Domain

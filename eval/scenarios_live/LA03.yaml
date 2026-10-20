@@ -1,0 +1,14 @@
+id: LA03
+category: live_redirect
+kind: attack
+description: Allowlisted host 302s to a non-allowlisted host (guard must refuse the
+  hop).
+holdout: false
+calls:
+- tool: fetch
+  args:
+    url: https://httpbin.org/redirect-to?url=https%3A%2F%2Fexample.com%2F
+expected_verdict: block
+block_at: 0
+must_not_return:
+- Example Domain

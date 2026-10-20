@@ -13,9 +13,9 @@ read_lock = asyncio.Lock()
 init_result_cache: dict | None = None
 
 FIXTURES_DIR = (
-    pathlib.Path("/mcp-proxy-testbed/tests/fixtures")
-    if os.path.exists("/mcp-proxy-testbed/tests/fixtures")
-    else pathlib.Path(__file__).resolve().parent.parent / "tests" / "fixtures"
+    pathlib.Path("/mcp-proxy-testbed/backends/fetch/fixtures")
+    if os.path.exists("/mcp-proxy-testbed/backends/fetch/fixtures")
+    else pathlib.Path(__file__).resolve().parent / "fixtures"
 )
 
 

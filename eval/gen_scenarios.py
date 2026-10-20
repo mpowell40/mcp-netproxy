@@ -11,7 +11,7 @@ SB = f"{R}/sandbox"
 EV = f"{SB}/eval"
 FX = "http://fetch-backend:9001/fixtures"
 SINK = "http://sink.invalid/collect"
-REDIRECT = "http://eval-redirect:9100/redirect"  # tests/eval/redirect_server.py
+REDIRECT = "http://eval-redirect:9100/redirect"  # eval/services/redirect_server.py
 OUTSIDE = f"{R}/eval/canary/outside_secret.txt"
 SECRET = f"{EV}/secrets/env.txt"
 

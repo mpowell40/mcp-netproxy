@@ -22,7 +22,7 @@ services:
 
   unprotected:
     container_name: mcp-unprotected
-    build: ./mcp-filesystem-backend
+    build: ./backends/filesystem
     ports:
       - "9000:9000"
     volumes:
@@ -30,7 +30,7 @@ services:
 
   fetch-backend:
     container_name: mcp-fetch-backend
-    build: ./mcp-fetch-backend
+    build: ./backends/fetch
     ports:
       - "9001:9001"
     environment:

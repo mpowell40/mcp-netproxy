@@ -799,7 +799,7 @@ class TestMultiServerCrossBackendDefense:
       latches session.is_tainted = True, and blocks subsequent write_file with -32001.
     """
 
-    _FIXTURES_DIR = _PROJECT_ROOT / "tests" / "fixtures"
+    _FIXTURES_DIR = _PROJECT_ROOT / "backends" / "fetch" / "fixtures"
 
     def test_html_fixtures_scanner_verdicts(self):
         """Verify portal_update.html triggers ingest_scanner and portal_status.html passes."""

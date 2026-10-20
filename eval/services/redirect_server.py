@@ -3,7 +3,7 @@
 Not part of the proxy. Serves ``GET /redirect?to=<url>`` with a 302 to
 ``<url>`` so the eval can check whether a fetch that starts at an
 innocuous host and is redirected to a ``.invalid`` sink is caught.
-Started only via ``tests/eval/docker-compose.eval.yml``.
+Started only via ``compose/eval.yml``.
 """
 
 from http.server import BaseHTTPRequestHandler, HTTPServer

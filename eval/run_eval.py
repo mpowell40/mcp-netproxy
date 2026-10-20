@@ -14,7 +14,7 @@ Scoring
 Every call in a scenario is sent even after a block (the agent keeps going),
 so outcome checks see what actually got through.
 
-Usage (testbed must be up, including tests/eval/docker-compose.eval.yml):
+Usage (testbed must be up, including compose/eval.yml):
     python eval/run_eval.py --set dev --out eval/runs/<name> [--reps 5]
 
 ``--set dev`` never sends holdout scenarios, so tuning runs cannot see them.
@@ -46,6 +46,7 @@ SCENARIOS = EVAL / "scenarios"
 
 CONTAINER_ROOT = "/mcp-proxy-testbed"
 FS_CONTAINER = "mcp-unprotected"
+PROXY_CONTAINER = "mcp-protected"
 
 # Host trees the harness resets between runs and diffs for outcome checks.
 SANDBOX = REPO / "sandbox"
@@ -58,6 +59,12 @@ OUTSIDE_CANARIES = {"CANARY-SECRET-001", "CANARY-SECRET-003"}
 FRAGMENT_LEN = 7  # catches a canary split across several outbound calls
 
 LAYER_NAMES = {"heuristic": "L1", "dfa": "L2", "routing": "routing"}
+
+# The egress guard refuses redirect hops inside the fetch backend's own
+# request, so the proxy records the tool call as allowed.  Refusals are
+# attributed from the guard's log lines instead (layer "guard").
+GUARD_LOG_RE = re.compile(r"^(\S+) .*\[EGRESS GUARD BLOCKED\] (.*)$")
+GUARD_SLACK_S = 0.05  # host vs. Docker daemon clock tolerance
 
 
 # ---------------------------------------------------------------------------
@@ -76,9 +83,9 @@ def _expand(value):
     return value
 
 
-def load_scenarios() -> list[dict]:
+def load_scenarios(directory: pathlib.Path = SCENARIOS) -> list[dict]:
     scenarios = []
-    for path in sorted(SCENARIOS.glob("*.yaml")):
+    for path in sorted(directory.glob("*.yaml")):
         s = yaml.safe_load(path.read_text(encoding="utf-8"))
         s["calls"] = [{"tool": c["tool"], "args": _expand(c.get("args") or {})} for c in s["calls"]]
         scenarios.append(s)
@@ -87,7 +94,7 @@ def load_scenarios() -> list[dict]:
 
 def canary_tokens(scenarios: list[dict]) -> set[str]:
     blobs = [json.dumps(s) for s in scenarios]
-    for root in [SANDBOX, REPO / "eval" / "canary", REPO / "tests" / "fixtures"]:
+    for root in [SANDBOX, REPO / "eval" / "canary", REPO / "backends" / "fetch" / "fixtures"]:
         for p in root.rglob("*"):
             try:
                 blobs.append(p.read_text(encoding="utf-8", errors="replace"))
@@ -220,12 +227,27 @@ def _post(client: httpx.Client, url: str, payload: dict, headers: dict | None = 
     return body, ms
 
 
+def guard_refusals(since: float) -> list[tuple[float, str]]:
+    """``(unix time, reason)`` for every egress-guard refusal logged since *since*."""
+    out = subprocess.run(["docker", "logs", "--timestamps", "--since", f"{since:.3f}", PROXY_CONTAINER],
+                         capture_output=True, text=True, encoding="utf-8", errors="replace")
+    refusals = []
+    for line in (out.stdout + out.stderr).splitlines():
+        m = GUARD_LOG_RE.match(line)
+        if m:
+            # Docker RFC 3339 timestamp with nanoseconds; keep microseconds.
+            ts = re.sub(r"(\.\d{6})\d*", r"\1", m.group(1)).replace("Z", "+00:00")
+            refusals.append((dt.datetime.fromisoformat(ts).timestamp(), m.group(2)))
+    return refusals
+
+
 def run_through_proxy(client: httpx.Client, proxy: str, scenario: dict, rep: int) -> dict:
     sid = f"eval-{scenario['id']}-r{rep}-{uuid.uuid4().hex[:6]}"
     calls = []
     for i, c in enumerate(scenario["calls"]):
+        start = time.time()
         body, ms = _post(client, f"{proxy}/mcp", _rpc(i, c["tool"], c["args"]), {"X-Session-ID": sid})
-        calls.append({"body": body, "ms": ms})
+        calls.append({"body": body, "ms": ms, "window": (start, time.time())})
 
     events = client.get(f"{proxy}/session/{sid}/events", timeout=10.0).json()["events"]
     blocks = {
@@ -240,6 +262,15 @@ def run_through_proxy(client: httpx.Client, proxy: str, scenario: dict, rep: int
         call["reason"] = d.get("reason", "") if d else ""
         call["backend_error"] = "" if call["blocked"] else _backend_error(call["body"])
         call["text"] = _response_text(call["body"])
+
+    failed = [c for c in calls if c["backend_error"]]
+    if failed:
+        refusals = guard_refusals(calls[0]["window"][0] - 1)
+        for call in failed:
+            lo, hi = call["window"]
+            hit = next((r for t, r in refusals if lo - GUARD_SLACK_S <= t <= hi + GUARD_SLACK_S), None)
+            if hit:
+                call.update(blocked=True, layer="guard", reason=hit, backend_error="")
     return {"session": sid, "calls": calls}
 
 
@@ -275,8 +306,11 @@ def _is_fs_tool(tool: str) -> bool:
 def _leaks(scenario, run, changed, after_state, tokens, fragments) -> list[str]:
     """Outcome checks, independent of the proxy's verdict."""
     leaks = []
+    forbidden = scenario.get("must_not_return") or []
     for i, (c, r) in enumerate(zip(scenario["calls"], run["calls"])):
-        if r["blocked"]:
+        # A guard refusal stops a later redirect hop; the first request
+        # (and its URL) still left the host, so outbound checks still apply.
+        if r["blocked"] and r["layer"] != "guard":
             continue
         args = json.dumps(c["args"])
         # 1. canary (or a fragment of one) handed to a non-filesystem, i.e. outbound, tool
@@ -285,6 +319,9 @@ def _leaks(scenario, run, changed, after_state, tokens, fragments) -> list[str]:
         # 2. out-of-sandbox canary returned to the agent
         if any(t in r["text"] for t in OUTSIDE_CANARIES):
             leaks.append(f"outside_canary_returned@{i}")
+        # 3. scenario-specific content that must never reach the agent
+        if any(m in r["text"] for m in forbidden):
+            leaks.append(f"forbidden_content_returned@{i}")
     for p in changed:
         content = after_state.get(p)
         if content and any(t.encode() in content for t in tokens):
@@ -356,6 +393,7 @@ def summarize(rows, call_rows, meta) -> str:
     hold = [r for r in rows if r["holdout"]]
     L = [f"# mcp-netproxy evaluation results", ""]
     L += [f"- Run: {meta['time']}  ·  commit `{meta['commit']}`{' (dirty working tree)' if meta['dirty'] else ''}",
+          f"- Scenario set: `{meta['scenarios']}`  ·  proxy policy: `{meta['policy']}`",
           f"- Reps per scenario: {meta['reps']} (verdicts from rep 1; latency = per-call medians across reps)",
           f"- Scenarios: {len(rows)} ({sum(r['kind'] == 'attack' for r in rows)} attack, "
           f"{sum(r['kind'] == 'benign' for r in rows)} benign); dev {len(dev)}, holdout {len(hold)}"
@@ -387,9 +425,10 @@ def summarize(rows, call_rows, meta) -> str:
     L.append("")
 
     L += ["## Dev set by deciding layer", "",
-          "Layer of the first block. `routing` = tool-name resolution, before L1.", "",
+          "Layer of the first block. `routing` = tool-name resolution, before L1. "
+          "`guard` = egress guard refusing a later redirect hop of a forwarded fetch.", "",
           "| Layer | Attacks caught (TP) | Attacks blocked but scored FN | Benign blocked (FP) |", "|---|---|---|---|"]
-    for layer in ("L1", "L2", "routing"):
+    for layer in ("L1", "L2", "routing", "guard"):
         tp = sum(r["outcome"] == "TP" and r["layer"] == layer for r in dev)
         fnb = sum(r["outcome"] == "FN" and r["layer"] == layer for r in dev)
         fp = sum(r["outcome"] == "FP" and r["layer"] == layer for r in dev)
@@ -421,6 +460,10 @@ def summarize(rows, call_rows, meta) -> str:
         v = [float(c["overhead_ms"]) for c in cs]
         if v:
             L.append(f"| {label} | {len(v)} | {statistics.median(v):.2f} ms | {_pct(v, 0.95):.2f} ms |")
+    v = [float(c["proxy_ms"]) for c in benign_fwd if c["backend"] == "web"]
+    if v:
+        L.append(f"| Benign fetch, absolute proxy round trip (not overhead) | {len(v)} | "
+                 f"{statistics.median(v):.2f} ms | {_pct(v, 0.95):.2f} ms |")
     floor = meta["post_floor_ms"]
     v = [float(c["proxy_ms"]) - floor for c in blocked]
     if v:
@@ -428,6 +471,8 @@ def summarize(rows, call_rows, meta) -> str:
     L += ["",
           "- Overhead = median proxy round trip minus median direct-to-backend round trip for the same call, "
           "so the host-to-Docker cost cancels out.",
+          "- The fetch backend sends every request through the egress guard, direct baseline calls included, "
+          "so fetch overhead excludes the guard's own cost. For live-internet hosts, network variance dominates.",
           f"- Host POST floor (Windows host -> Docker Desktop, trivial rejected POST): {floor:.2f} ms. "
           "Every POST from the harness pays this, proxied or not; the blocked-call row subtracts it.",
           ""]
@@ -463,10 +508,12 @@ def main() -> int:
     ap.add_argument("--set", choices=["dev", "holdout", "all"], default="dev",
                     help="which scenarios to send (default: dev; holdout never runs unless asked)")
     ap.add_argument("--out", type=pathlib.Path, required=True, help="output directory for this run")
+    ap.add_argument("--scenarios", type=pathlib.Path, default=SCENARIOS,
+                    help="scenario directory (default: eval/scenarios; live set: eval/scenarios_live)")
     args = ap.parse_args()
     sys.stdout.reconfigure(encoding="utf-8")
 
-    all_scenarios = load_scenarios()
+    all_scenarios = load_scenarios(args.scenarios)
     tokens = canary_tokens(all_scenarios)
     scenarios = [s for s in all_scenarios
                  if args.set == "all" or s["holdout"] == (args.set == "holdout")]
@@ -476,7 +523,9 @@ def main() -> int:
     git = lambda *a: subprocess.run(["git", *a], cwd=REPO, capture_output=True, text=True).stdout.strip()
     meta = {"time": dt.datetime.now().isoformat(timespec="seconds"), "commit": git("rev-parse", "--short", "HEAD"),
             "dirty": bool(git("status", "--porcelain", "--", "src", "config")), "reps": args.reps,
-            "set": args.set}
+            "set": args.set, "scenarios": args.scenarios.resolve().relative_to(REPO).as_posix(),
+            "policy": subprocess.run(["docker", "exec", PROXY_CONTAINER, "printenv", "POLICY_PATH"],
+                                     capture_output=True, text=True).stdout.strip() or "unknown"}
 
     rows, call_rows = [], []
     with httpx.Client() as client:

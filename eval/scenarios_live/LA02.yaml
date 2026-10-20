@@ -1,0 +1,13 @@
+id: LA02
+category: live_boundary
+kind: attack
+description: 'Userinfo trick: allowlisted name before ''@'', real host after.'
+holdout: false
+calls:
+- tool: fetch
+  args:
+    url: https://api.github.com@example.com/
+expected_verdict: block
+block_at: 0
+must_not_return:
+- Example Domain

@@ -1,0 +1,8 @@
+# LIVE-INTERNET overlay. Switches the proxy to config/policy.live.yaml, which
+# allowlists a few public read-only sites for the fetch backend.
+#   docker compose -f docker-compose.yml -f compose/live.yml up -d
+# Drop this file from the command to return to the frozen eval policy.
+services:
+  protected:
+    environment:
+      - POLICY_PATH=/app/config/policy.live.yaml
