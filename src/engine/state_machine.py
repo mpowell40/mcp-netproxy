@@ -18,6 +18,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, NamedTuple
 
+from src.engine.labels import LabelOrigin, LabelResolver, describe_source
 from src.models.policy import ForbiddenInvariant, PolicyConfig, ToolState
 
 logger = logging.getLogger("mcp-netproxy")
@@ -25,9 +26,9 @@ logger = logging.getLogger("mcp-netproxy")
 DEFAULT_SESSION_TTL = 3600.0  # seconds of inactivity before a session is evicted
 DEFAULT_MAX_HISTORY = 1024  # per-session bound on transition / trajectory records
 MAX_TAINT_ORIGINS = 32  # per-session bound on recorded taint origins
+MAX_LABEL_ORIGINS = 32  # per-session, per-label bound on recorded label origins
 
-# Argument names that identify what a tool read, in priority order
-_SOURCE_ARGUMENTS = ("path", "url", "uri", "paths", "source", "query")
+__all__ = ["SessionGraphManager", "SessionState", "TaintOrigin", "describe_source", "DEFAULT_SESSION_TTL"]
 
 
 @dataclass
@@ -84,6 +85,10 @@ class SessionState:
     visited_states: set[ToolState] = field(default_factory=lambda: {ToolState.START})
     taint_vector: list[TaintOrigin] = field(default_factory=list)
     taint_origins_dropped: int = 0
+    # Provenance labels: label -> origins.  Sticky: entries are never removed;
+    # the label set is the key set, so the origin bound never clears a label.
+    labels: dict[str, list[LabelOrigin]] = field(default_factory=dict)
+    label_origins_dropped: int = 0
     created_at: float = field(default_factory=time.time)
     last_seen: float = 0.0  # engine clock (monotonic), used for TTL expiry
 
@@ -101,13 +106,25 @@ class SessionState:
             self.taint_origins_dropped += 1
 
 
-def describe_source(tool_name: str, arguments: dict[str, Any] | None) -> str:
-    """Render ``tool:target`` for taint attribution (``fs__read_file:notes.txt``)."""
-    for key in _SOURCE_ARGUMENTS:
-        value = (arguments or {}).get(key)
-        if value:
-            return f"{tool_name}:{value}"
-    return tool_name
+    @property
+    def label_set(self) -> frozenset[str]:
+        """Labels the session carries (the join of every source it has read)."""
+        return frozenset(self.labels)
+
+    def add_label(self, origin: LabelOrigin) -> bool:
+        """Join *origin*'s label into the session; False if already recorded."""
+        origins = self.labels.setdefault(origin.label, [])
+        key = (origin.source, origin.rule)
+        if any((o.source, o.rule) == key for o in origins):
+            return False
+        if len(origins) < MAX_LABEL_ORIGINS:
+            origins.append(origin)
+        else:
+            self.label_origins_dropped += 1
+        return True
+
+    def labels_dict(self) -> dict[str, list[dict[str, Any]]]:
+        return {label: [o.to_dict() for o in origins] for label, origins in sorted(self.labels.items())}
 
 
 class SessionGraphManager:
@@ -128,6 +145,7 @@ class SessionGraphManager:
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._policy = policy
+        self._labels = LabelResolver(policy)
         self._sessions: dict[str, SessionState] = {}
         self._lock = threading.Lock()  # Protects _sessions dict creation
         self._session_locks: dict[str, threading.Lock] = {}
@@ -303,6 +321,35 @@ class SessionGraphManager:
             meta["status"] = record.status
             return True, reason, meta
 
+    def record_source(
+        self, session_id: str, tool_name: str, arguments: dict[str, Any] | None = None
+    ) -> list[LabelOrigin]:
+        """Apply the labels of the source this call read from.
+
+        Called once the backend has answered (successfully or not): labels
+        are decided by the policy's source rules for this tool and its path
+        arguments, never by the response content.  Returns the origins that
+        were new to the session.
+        """
+        origins = self._labels.source_labels(
+            tool_name, self._policy.resolve_state(tool_name, arguments), arguments
+        )
+        return self.apply_labels(session_id, origins)
+
+    def apply_labels(self, session_id: str, origins: list[LabelOrigin]) -> list[LabelOrigin]:
+        """Join *origins* into the session's labels; return those not seen before."""
+        if not origins:
+            return []
+        session, slock = self._get_session(session_id)
+        with slock:
+            return [o for o in origins if session.add_label(o)]
+
+    def label(
+        self, session_id: str, label: str, *, source: str = "[manual]", rule: str = "manual"
+    ) -> None:
+        """Label a session directly (operators and tests)."""
+        self.apply_labels(session_id, [LabelOrigin(label, source, rule)])
+
     def get_session_history(
         self, session_id: str
     ) -> list[TransitionRecord]:
@@ -341,6 +388,8 @@ class SessionGraphManager:
                     for o in session.taint_vector
                 ],
                 "taint_origins_dropped": session.taint_origins_dropped,
+                "labels": session.labels_dict(),
+                "label_origins_dropped": session.label_origins_dropped,
                 "state_history": [
                     {"timestamp": e.timestamp, "state": e.state.value, "tool_invoked": e.tool_invoked}
                     for e in session.state_history

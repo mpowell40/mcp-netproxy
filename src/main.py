@@ -327,10 +327,24 @@ def create_app(
         upstream_payload = {**payload, "params": {**params, "name": resolved.upstream}}
         response = await _forward(upstream_payload, target_backend, app.state.http_client)
 
+        after: dict[str, Any] = {"scanned": False, "tainted": False, "status_code": response.status_code}
+
+        # -- Provenance labels --------------------------------------------
+        # Whatever the backend returned (results, JSON-RPC errors, isError
+        # results) reached the agent, so the source's labels apply.  Only a
+        # proxy-generated connection failure carries no backend data.
+        if not isinstance(response, _ForwardFailure):
+            applied = _engine.record_source(session_id, resolved.canonical, arguments)
+            if applied:
+                after["labels_applied"] = [o.to_dict() for o in applied]
+                logger.info(
+                    f"[PROVENANCE] Session '{session_id}' labeled "
+                    f"{sorted({o.label for o in applied})} by '{resolved.canonical}'"
+                )
+
         # -- Layer 3: Dynamic Ingest Scanner (response inspection) --------
         # For content-returning tools on backends with scan_responses enabled,
         # scan the response payload for imperative prompt-injection directives.
-        after: dict[str, Any] = {"scanned": False, "tainted": False, "status_code": response.status_code}
         if _registry.should_scan(resolved, ToolState(meta["to_state"])):
             after["scanned"] = True
             try:
@@ -459,6 +473,10 @@ async def _backend_client(shared: httpx.AsyncClient | None):
             yield client
 
 
+class _ForwardFailure(Response):
+    """Proxy-generated error: the backend was never reached or never answered."""
+
+
 async def _forward(payload: dict, downstream_url: str, shared: httpx.AsyncClient | None = None) -> Response:
     """Forward a JSON-RPC payload to the specified downstream MCP server."""
     async with _backend_client(shared) as client:
@@ -470,12 +488,13 @@ async def _forward(payload: dict, downstream_url: str, shared: httpx.AsyncClient
                 media_type="application/json",
             )
         except Exception as exc:
-            return _jsonrpc_error(
+            error = _jsonrpc_error(
                 payload.get("id"),
                 -32000,
                 f"Downstream connection error: {exc}",
                 status=502,
             )
+            return _ForwardFailure(content=error.body, status_code=502, media_type="application/json")
 
 
 async def _handle_tools_list(
