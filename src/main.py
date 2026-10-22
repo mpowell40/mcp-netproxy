@@ -285,9 +285,13 @@ def create_app(
                 f"[SECURITY BLOCKED - DFA INVARIANT] Session '{session_id}' denied transition: "
                 f"tool='{resolved.canonical}', state='{meta['from_state']}' -> '{meta['to_state']}', reason='{reason}'"
             )
+            # Label sink blocks are part of Layer 2 ("dfa"); ``check`` names
+            # which Layer 2 check fired.
+            extra = {k: meta[k] for k in ("check", "sink_rules", "labels") if k in meta}
             block(
                 "dfa", reason, resolved.canonical,
                 current_state=meta["from_state"], target_state=meta["to_state"], status=meta["status"],
+                **extra,
             )
             return _jsonrpc_error(
                 request_id,
@@ -298,6 +302,7 @@ def create_app(
                     "attempted_tool": resolved.canonical,
                     "target_state": meta["to_state"],
                     "reason": reason,
+                    **extra,
                 },
                 status=200,
             )

@@ -3,7 +3,7 @@
 Validates:
 1. Every checkpoint (BEFORE/AFTER_TOOL_LIST, BEFORE/AFTER_TOOL_CALL) emits a
    structured ProxyEvent with session, tool, state, decision and timestamp.
-2. The taint vector attributes taint to its source tool/target and pattern.
+2. Session labels attribute each label to its source tool/target and rule.
 3. ``state_history`` records the trajectory and is bounded.
 4. Idle sessions expire after the configured TTL.
 5. Concurrent sessions never share taint or DFA state.
@@ -227,9 +227,9 @@ class TestCheckpointEvents:
 # 2. Taint vector attribution
 # ===========================================================================
 
-class TestTaintVector:
+class TestLabelAttribution:
 
-    def test_dynamic_scan_records_source_and_pattern(self, client, engine):
+    def test_fetch_records_label_source_and_rule(self, client, engine):
         async def post(url, json, timeout=10.0):
             return _result(json["id"], _INJECTION_TEXT)
 
@@ -245,29 +245,27 @@ class TestTaintVector:
 
         session, _ = engine._get_session("taint-01")
         assert session.is_tainted is True
-        (origin,) = session.taint_vector
-        assert origin.taint_source == "web__fetch:http://evil.example/page"
-        assert origin.trigger_pattern == "AGENT_TARGET_HEADER"
+        tool_origins = [o for o in session.labels["untrusted"] if o.rule == "tool:web__fetch"]
+        assert [o.source for o in tool_origins] == ["web__fetch:http://evil.example/page"]
 
         context = client.get("/session/taint-01").json()
-        assert context["taint_vector"][0]["trigger_pattern"] == "AGENT_TARGET_HEADER"
+        assert "tool:web__fetch" in {o["rule"] for o in context["labels"]["untrusted"]}
 
     def test_static_mapping_records_origin(self, engine):
         allowed, _, _ = engine.evaluate_transition("taint-02", "web_search", {"query": "x"})
         assert allowed
+        engine.record_source("taint-02", "web_search", {"query": "x"})
         session, _ = engine._get_session("taint-02")
-        (origin,) = session.taint_vector
-        assert origin.taint_source == "web_search:x"
-        assert origin.trigger_pattern == "STATIC_POLICY_MAPPING"
+        (origin,) = session.labels["untrusted"]
+        assert origin.source == "web_search:x"
+        assert origin.rule == "tool:web_search"
 
-    def test_latch_blocks_write_and_reports_vector(self, engine):
-        engine.taint_session(
-            "taint-03", taint_source="fs__read_file:notes.txt", trigger_pattern="HEADER_DIRECTIVE"
-        )
+    def test_label_blocks_write_and_reports_origins(self, engine):
+        engine.label("taint-03", "untrusted", source="fs__read_file:notes.txt", rule="path:**/inbox/**")
         engine.evaluate_transition("taint-03", "fs__read_file")
         allowed, _, meta = engine.evaluate_transition("taint-03", "fs__write_file")
         assert not allowed
-        assert meta["taint_vector"] == ["fs__read_file:notes.txt"]
+        assert [o["source"] for o in meta["labels"]["untrusted"]] == ["fs__read_file:notes.txt"]
 
     def test_unknown_session_context_is_404(self, client):
         assert client.get("/session/never-seen").status_code == 404
@@ -300,13 +298,14 @@ class TestStateHistory:
 
     def test_history_is_bounded_but_invariants_survive(self, policy):
         engine = SessionGraphManager(policy, max_history=5)
-        engine.evaluate_transition("hist-03", "web_search")  # taint early
+        engine.evaluate_transition("hist-03", "web_search")  # label early
+        engine.record_source("hist-03", "web_search", {"query": "x"})
         for _ in range(20):
             engine.evaluate_transition("hist-03", "fs__read_file")
         session, _ = engine._get_session("hist-03")
         assert len(session.state_history) == 5
         assert len(engine.get_session_history("hist-03")) == 5
-        # The tainting step has scrolled out of history; the latch has not
+        # The labeling step has scrolled out of history; the label has not
         allowed, _, _ = engine.evaluate_transition("hist-03", "fs__write_file")
         assert not allowed
 
@@ -372,7 +371,7 @@ class TestSessionIsolation:
             for _ in range(25):
                 engine.evaluate_transition(sid, "fs__read_file")
             if poison:
-                engine.taint_session(sid, taint_source=sid)
+                engine.label(sid, "untrusted", source=sid)
             engine.evaluate_transition(sid, "fs__write_file")
 
         threads = [
@@ -388,8 +387,8 @@ class TestSessionIsolation:
             session, _ = engine._get_session(sid)
             last = engine.get_session_history(sid)[-1]
             if i % 2 == 0:
-                assert [o.taint_source for o in session.taint_vector] == [sid]
-                assert last.status == "BLOCKED_INVARIANT"
+                assert [o.source for o in session.labels["untrusted"]] == [sid]
+                assert last.status == "BLOCKED_LABEL"
             else:
                 assert session.is_tainted is False
                 assert last.status == "ALLOWED"

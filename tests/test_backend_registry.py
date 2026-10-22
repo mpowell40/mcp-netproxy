@@ -393,8 +393,10 @@ class TestScanResponsesFlag:
         session, _ = engine._get_session("scan-on-01")
         assert session.is_tainted is True
 
-    def test_scanning_disabled_does_not_taint(self, client, policy, engine):
+    def test_scanning_disabled_still_labels_by_provenance(self, client, policy, engine):
+        # The scanner is no longer what labels a session: fetch is untrusted
+        # by tool, whether or not its response is scanned.
         policy.backends["web"].scan_responses = False
         self._fetch_injection(client, "scan-off-01")
         session, _ = engine._get_session("scan-off-01")
-        assert session.is_tainted is False
+        assert {o.rule for o in session.labels["untrusted"]} == {"tool:web__fetch"}

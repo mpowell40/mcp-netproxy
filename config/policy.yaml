@@ -69,8 +69,8 @@ backends:
         - fetch-backend      # internal Docker address
     tools:
       # Outbound request: the URL itself can carry data off-host, so fetch
-      # is egress.  Its response is still external content and is scanned;
-      # taint is applied by the ingest scanner rather than on every fetch.
+      # is egress.  Every response is external content and labels the
+      # session untrusted (labels.sources.untrusted.tools), whatever it says.
       fetch: NETWORK_EGRESS
 
 # ----------------------------------------------------------------------------
@@ -207,8 +207,9 @@ allowed_transitions:
   NETWORK_EGRESS:
     - DISCOVERY
     - LOCAL_READ
-    # Only reachable while the session is untainted: the sticky taint latch
-    # blocks every LOCAL_WRITE once the scanner has flagged ingested content.
+    # Reachable only by an egress tool that is not an untrusted source:
+    # every fetch labels the session untrusted, and the untrusted sink rule
+    # blocks LOCAL_WRITE before this graph is consulted.
     - LOCAL_WRITE
 
 # Invariant rules that trigger fatal violations regardless of allowed_transitions.

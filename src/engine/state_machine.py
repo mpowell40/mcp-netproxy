@@ -7,6 +7,10 @@ Mermaid.js diagrams for forensic analysis.
 Each session is an isolated ``SessionState`` keyed by session_id, guarded
 by its own lock.  The PolicyConfig transition graph is shared read-only;
 nothing a session does is written back into it.
+
+Before the transition graph, every call is checked against the session's
+provenance labels: the policy's ``labels.sinks`` rules name the DFA states
+each label may not reach (e.g. ``untrusted`` -> LOCAL_WRITE).
 """
 
 from __future__ import annotations
@@ -19,16 +23,15 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, NamedTuple
 
 from src.engine.labels import LabelOrigin, LabelResolver, describe_source
-from src.models.policy import ForbiddenInvariant, PolicyConfig, ToolState
+from src.models.policy import ForbiddenInvariant, PolicyConfig, SinkRule, ToolState
 
 logger = logging.getLogger("mcp-netproxy")
 
 DEFAULT_SESSION_TTL = 3600.0  # seconds of inactivity before a session is evicted
 DEFAULT_MAX_HISTORY = 1024  # per-session bound on transition / trajectory records
-MAX_TAINT_ORIGINS = 32  # per-session bound on recorded taint origins
 MAX_LABEL_ORIGINS = 32  # per-session, per-label bound on recorded label origins
 
-__all__ = ["SessionGraphManager", "SessionState", "TaintOrigin", "describe_source", "DEFAULT_SESSION_TTL"]
+__all__ = ["SessionGraphManager", "SessionState", "describe_source", "DEFAULT_SESSION_TTL"]
 
 
 @dataclass
@@ -39,7 +42,7 @@ class TransitionRecord:
     tool_name: str
     from_state: ToolState
     to_state: ToolState
-    status: str  # "ALLOWED" | "BLOCKED_TRANSITION" | "BLOCKED_INVARIANT" | "BLOCKED_UNKNOWN"
+    status: str  # "ALLOWED" | "BLOCKED_LABEL" | "BLOCKED_TRANSITION" | "BLOCKED_INVARIANT" | "BLOCKED_UNKNOWN"
     reason: str = ""
 
 
@@ -49,23 +52,6 @@ class StateHistoryEntry(NamedTuple):
     timestamp: float
     state: ToolState
     tool_invoked: str
-
-
-@dataclass(frozen=True)
-class TaintOrigin:
-    """Where a session's taint came from.
-
-    Attributes:
-        taint_source: Tool and target that delivered the content,
-            e.g. ``"fs__read_file:/sandbox/notes.txt"``.
-        trigger_pattern: Detector that fired, e.g. ``"HEADER_DIRECTIVE"``,
-            or ``"STATIC_POLICY_MAPPING"`` for tools mapped to UNTRUSTED_INGEST.
-    """
-
-    taint_source: str
-    trigger_pattern: str
-    reason: str = ""
-    timestamp: float = field(default_factory=time.time)
 
 
 @dataclass
@@ -83,8 +69,6 @@ class SessionState:
     # Unbounded by design: invariants depend on every state ever visited,
     # and the set can hold at most len(ToolState) members.
     visited_states: set[ToolState] = field(default_factory=lambda: {ToolState.START})
-    taint_vector: list[TaintOrigin] = field(default_factory=list)
-    taint_origins_dropped: int = 0
     # Provenance labels: label -> origins.  Sticky: entries are never removed;
     # the label set is the key set, so the origin bound never clears a label.
     labels: dict[str, list[LabelOrigin]] = field(default_factory=dict)
@@ -94,16 +78,8 @@ class SessionState:
 
     @property
     def is_tainted(self) -> bool:
-        """Sticky latch: True once any taint origin has been recorded."""
-        return bool(self.taint_vector)
-
-    def add_taint(self, origin: TaintOrigin) -> None:
-        # Keep the earliest origins (the root cause) and count the overflow;
-        # the latch itself never depends on the bound.
-        if len(self.taint_vector) < MAX_TAINT_ORIGINS:
-            self.taint_vector.append(origin)
-        else:
-            self.taint_origins_dropped += 1
+        """True once the session carries any provenance label."""
+        return bool(self.labels)
 
 
     @property
@@ -254,27 +230,20 @@ class SessionGraphManager:
                 meta["status"] = record.status
                 return False, reason, meta
 
-            # 2. Sticky taint latch check:
-            # If session is tainted, mutating or egress actions are strictly forbidden
-            if session.is_tainted and to_state in (
-                ToolState.LOCAL_WRITE,
-                ToolState.EXECUTE,
-                ToolState.NETWORK_EGRESS,
-            ):
-                reason = (
-                    "Session taint persistent latch: Untrusted ingestion cannot "
-                    "directly mutate local files or trigger privileged egress "
-                    "(mitigating indirect prompt injection)."
-                )
+            # 2. Label sink policy (sticky provenance labels):
+            # a session carrying a label may never reach that label's sinks.
+            violated_sinks = self._sink_violations(session, to_state)
+            if violated_sinks:
+                reason = violated_sinks[0].reason
                 record = self._record(
-                    session, tool_name, from_state, to_state, "BLOCKED_INVARIANT", reason
+                    session, tool_name, from_state, to_state, "BLOCKED_LABEL", reason
                 )
                 meta["status"] = record.status
-                meta["invariant_rule"] = {
-                    "from": from_state.value,
-                    "to": to_state.value,
-                }
-                meta["taint_vector"] = [o.taint_source for o in session.taint_vector]
+                meta["check"] = "label_sink"
+                meta["sink_rules"] = [
+                    {"label": r.label, "block": [b.value for b in r.block]} for r in violated_sinks
+                ]
+                meta["labels"] = session.labels_dict()
                 return False, reason, meta
 
             # 3. Check forbidden invariants (takes priority over allowed)
@@ -305,21 +274,21 @@ class SessionGraphManager:
                 meta["status"] = record.status
                 return False, reason, meta
 
-            # 5. Valid: advance state
+            # 5. Valid: advance state.  Labels are applied by record_source()
+            # once the backend has answered, not here.
             session.current_state = to_state
             session.visited_states.add(to_state)
-            if to_state is ToolState.UNTRUSTED_INGEST:
-                session.add_taint(
-                    TaintOrigin(
-                        taint_source=describe_source(tool_name, arguments),
-                        trigger_pattern="STATIC_POLICY_MAPPING",
-                        reason=f"'{tool_name}' is mapped to UNTRUSTED_INGEST",
-                    )
-                )
             reason = "Allowed"
             record = self._record(session, tool_name, from_state, to_state, "ALLOWED", reason)
             meta["status"] = record.status
             return True, reason, meta
+
+    def _sink_violations(self, session: SessionState, to_state: ToolState) -> list[SinkRule]:
+        """Sink rules whose label the session carries and whose sinks include *to_state*."""
+        return [
+            rule for rule in self._policy.labels.sinks
+            if rule.label in session.labels and to_state in rule.block
+        ]
 
     def record_source(
         self, session_id: str, tool_name: str, arguments: dict[str, Any] | None = None
@@ -378,16 +347,6 @@ class SessionGraphManager:
                 "session_id": session.session_id,
                 "current_state": session.current_state.value,
                 "is_tainted": session.is_tainted,
-                "taint_vector": [
-                    {
-                        "taint_source": o.taint_source,
-                        "trigger_pattern": o.trigger_pattern,
-                        "reason": o.reason,
-                        "timestamp": o.timestamp,
-                    }
-                    for o in session.taint_vector
-                ],
-                "taint_origins_dropped": session.taint_origins_dropped,
                 "labels": session.labels_dict(),
                 "label_origins_dropped": session.label_origins_dropped,
                 "state_history": [
@@ -408,19 +367,16 @@ class SessionGraphManager:
         trigger_pattern: str = "UNSPECIFIED",
         reason: str = "Session tainted by dynamic response scanner",
     ) -> None:
-        """Retroactively taint a session's current state with a persistent sticky latch.
+        """Mark a session untrusted from a scanner verdict (transitional).
 
-        Used by the dynamic ingest scanner to override the DFA state when
-        response content analysis reveals untrusted directives. Once tainted,
-        session.is_tainted remains True persistently for the session lifetime,
-        blocking any subsequent mutating or egress actions even if intermediate
-        benign reads occur.  Each call appends a TaintOrigin to the session's
-        taint_vector for attribution.
+        Records an ``untrusted`` label whose rule names the scanner pattern
+        and moves the DFA to *taint_state*.  Removed once the scanner is
+        demoted to alert-only.
         """
         session, slock = self._get_session(session_id)
         with slock:
             from_state = session.current_state
-            session.add_taint(TaintOrigin(taint_source, trigger_pattern, reason))
+            session.add_label(LabelOrigin("untrusted", taint_source, f"scanner:{trigger_pattern}"))
             session.current_state = taint_state
             session.visited_states.add(taint_state)
             self._record(

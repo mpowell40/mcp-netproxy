@@ -595,12 +595,12 @@ class TestDynamicIngestScanner:
 
 class TestStateLaunderingPrevention:
     """Verify that intermediate benign reads or discovery calls do NOT
-    clear an active UNTRUSTED_INGEST taint latch (mitigating state laundering).
+    clear a sticky provenance label (mitigating state laundering).
     """
 
     def test_interleaved_benign_read_does_not_clear_taint(self, app_client, engine):
         """1. Initialize session session-interleave-01.
-        2. Execute read_text_file with untrusted directive -> session tainted.
+        2. Read a file under an untrusted inbox path -> session labeled untrusted.
         3. Execute read_text_file on benign file (clean_config.json) -> read succeeds.
         4. Attempt write_file -> proxy denies transition with -32001.
         """
@@ -640,17 +640,17 @@ class TestStateLaunderingPrevention:
                 "/mcp",
                 json=_jsonrpc_tool_call(
                     "read_text_file",
-                    {"path": "/mcp-proxy-testbed/sandbox/note_layer2_write.txt"},
+                    {"path": "/mcp-proxy-testbed/sandbox/inbox/note_layer2_write.txt"},
                     req_id=1,
                 ),
                 headers={"X-Session-ID": sid},
             )
             assert resp1.status_code == 200
 
-        # Verify session is tainted
+        # Verify session is labeled untrusted by the inbox path rule
         session, _ = engine._get_session(sid)
         assert session.is_tainted is True
-        assert session.current_state == ToolState.UNTRUSTED_INGEST
+        assert "untrusted" in session.label_set
 
         # Step 3: Execute read_text_file on benign clean_config.json
         clean_body = json.dumps({
@@ -711,20 +711,21 @@ class TestStateLaunderingPrevention:
         assert body3["id"] == 3
         assert body3["error"]["code"] == -32001
         assert "Security Invariant Violation" in body3["error"]["message"]
-        assert "persistent latch" in body3["error"]["data"]["reason"].lower()
+        assert body3["error"]["data"]["check"] == "label_sink"
+        assert "untrusted" in body3["error"]["data"]["labels"]
 
     def test_discovery_does_not_clear_taint(self, app_client, engine):
-        """1. Taint session with UNTRUSTED_INGEST.
+        """1. Label session untrusted.
         2. Call list_directory -> verify call succeeds.
         3. Attempt write_file -> verify transition is denied.
         """
         sid = "session-discovery-latch-01"
 
-        # 1. Taint session with UNTRUSTED_INGEST
-        engine.taint_session(sid, ToolState.UNTRUSTED_INGEST)
+        # 1. Label session untrusted (the DFA state is untouched)
+        engine.label(sid, "untrusted", source="web__fetch:http://evil.example")
         session, _ = engine._get_session(sid)
         assert session.is_tainted is True
-        assert session.current_state == ToolState.UNTRUSTED_INGEST
+        assert session.current_state == ToolState.START
 
         # 2. Call list_directory -> verify call succeeds
         ok, reason, meta = engine.evaluate_transition(sid, "list_directory")
@@ -733,11 +734,12 @@ class TestStateLaunderingPrevention:
         assert session.current_state == ToolState.DISCOVERY
         assert session.is_tainted is True
 
-        # 3. Attempt write_file -> verify transition is denied
+        # 3. Attempt write_file -> verify transition is denied (DISCOVERY ->
+        # LOCAL_WRITE is legal in the graph; the label alone blocks it)
         ok_write, reason_write, meta_write = engine.evaluate_transition(sid, "write_file")
         assert ok_write is False
-        assert meta_write["status"] == "BLOCKED_INVARIANT"
-        assert "persistent latch" in reason_write.lower()
+        assert meta_write["status"] == "BLOCKED_LABEL"
+        assert meta_write["sink_rules"][0]["label"] == "untrusted"
 
         # Also verify via HTTP proxy endpoint
         resp = app_client.post(
@@ -756,15 +758,17 @@ class TestStateLaunderingPrevention:
         body = resp.json()
         assert body["error"]["code"] == -32001
         assert "Security Invariant Violation" in body["error"]["message"]
-        assert "persistent latch" in body["error"]["data"]["reason"].lower()
+        assert body["error"]["data"]["check"] == "label_sink"
+        assert body["error"]["data"]["labels"]["untrusted"][0]["source"] == "web__fetch:http://evil.example"
 
     def test_sticky_taint_blocks_execute_and_egress(self, engine):
-        """Tainted session cannot execute commands or egress data even after intermediate reads."""
+        """Untrusted session cannot execute commands or egress data even after intermediate reads."""
         sid = "session-taint-egress-01"
 
-        # Taint session via direct UNTRUSTED_INGEST transition (e.g. scrape_url)
+        # scrape_url is an untrusted source by tool
         ok, _, _ = engine.evaluate_transition(sid, "scrape_url")
         assert ok is True
+        engine.record_source(sid, "scrape_url", {"url": "http://evil.example"})
         session, _ = engine._get_session(sid)
         assert session.is_tainted is True
 
@@ -774,15 +778,15 @@ class TestStateLaunderingPrevention:
         assert session.current_state == ToolState.LOCAL_READ
         assert session.is_tainted is True
 
-        # Attempt EXECUTE -> must be blocked by sticky latch
-        ok_exec, reason_exec, _ = engine.evaluate_transition(sid, "execute_command")
+        # Attempt EXECUTE -> must be blocked by the sticky label
+        ok_exec, _, meta_exec = engine.evaluate_transition(sid, "execute_command")
         assert ok_exec is False
-        assert "persistent latch" in reason_exec.lower()
+        assert meta_exec["check"] == "label_sink"
 
-        # Attempt NETWORK_EGRESS -> must be blocked by sticky latch
-        ok_egress, reason_egress, _ = engine.evaluate_transition(sid, "send_webhook")
+        # Attempt NETWORK_EGRESS -> must be blocked by the sticky label
+        ok_egress, _, meta_egress = engine.evaluate_transition(sid, "send_webhook")
         assert ok_egress is False
-        assert "persistent latch" in reason_egress.lower()
+        assert meta_egress["check"] == "label_sink"
 
 
 # ===========================================================================
@@ -794,7 +798,8 @@ class TestMultiServerCrossBackendDefense:
     and @modelcontextprotocol/server-fetch (:9001), confirming:
     - tools/list merges schemas from both backends.
     - tools/call routes fetch to :9001 and filesystem tools to :9000.
-    - Benign HTML fetch followed by write_file succeeds (no taint latch).
+    - Any HTML fetch, however clean, labels the session untrusted, so a
+      following write_file is blocked (provenance, not content).
     - Poisoned HTML fetch (portal_update.html) triggers ingest_scanner.py,
       latches session.is_tainted = True, and blocks subsequent write_file with -32001.
     """
@@ -863,9 +868,10 @@ class TestMultiServerCrossBackendDefense:
         merged_names = [t["name"] for t in body["result"]["tools"]]
         assert merged_names == ["fs__read_text_file", "fs__write_file", "fs__list_directory", "web__fetch"]
 
-    def test_benign_html_fetch_then_write_file_succeeds(self, policy, engine):
-        """Benign Path: A clean page fetch (:9001) followed by a legitimate
-        write_file (:9000) succeeds without triggering the taint latch.
+    def test_clean_html_fetch_then_write_file_blocked_by_provenance(self, policy, engine):
+        """A clean page fetch (:9001) still labels the session untrusted, so
+        the following write_file (:9000) is refused before forwarding.  This
+        is the intended cost of provenance labels (Phase 4 allowed it).
         """
         from unittest.mock import AsyncMock, patch
         from fastapi.testclient import TestClient
@@ -926,9 +932,9 @@ class TestMultiServerCrossBackendDefense:
             assert resp1.status_code == 200
             assert "result" in resp1.json()
 
-            # Verify session is NOT tainted after clean fetch
+            # The fetch labels the session untrusted, whatever the page says
             session, _ = engine._get_session(sid)
-            assert session.is_tainted is False
+            assert session.label_set == {"untrusted"}
             assert session.current_state == ToolState.NETWORK_EGRESS
 
             # Step 2: Legitimate write_file to /sandbox/build_status.txt (routed to :9000)
@@ -946,14 +952,11 @@ class TestMultiServerCrossBackendDefense:
             )
             assert resp2.status_code == 200
             body2 = resp2.json()
-            assert "error" not in body2
-            assert "result" in body2
+            assert body2["error"]["code"] == -32001
+            assert body2["error"]["data"]["check"] == "label_sink"
 
-        # Verify multi-backend dispatch routed fetch -> :9001 and write_file -> :9000
-        assert routed_urls == [
-            "http://fetch-backend:9001/mcp",
-            "http://unprotected:9000/mcp",
-        ]
+        # The fetch reached :9001; the write never reached :9000
+        assert routed_urls == ["http://fetch-backend:9001/mcp"]
 
     def test_poisoned_html_fetch_triggers_scanner_taint_and_blocks_write_file(self, policy, engine):
         """Poisoned Path: Fetching portal_update.html (:9001) triggers
