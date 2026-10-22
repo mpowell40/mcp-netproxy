@@ -1,0 +1,280 @@
+# ============================================================================
+# mcp-netproxy Behavioral State-Machine Policy
+# ============================================================================
+# Defines the DFA state space for Zero Trust enforcement of MCP tool calls.
+# Compatible with @modelcontextprotocol/server-filesystem and server-fetch.
+#
+# PHASE 5 LIVE-INTERNET PROFILE.  Identical to config/policy.yaml (the Phase 5
+# provenance-label policy) except web.egress.allowed_hosts, which adds the
+# same public read-only sites as the Phase 4 live profile
+# (config/policy.live.yaml).  Keep the two files in sync.  Enable with:
+#   docker compose -f docker-compose.yml -f compose/phase5-live.yml up -d
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Backend registry
+# ----------------------------------------------------------------------------
+# Each key is a backend namespace ([a-z][a-z0-9]*).  Every tool the backend
+# advertises is exposed to clients as "<namespace>__<tool>" (e.g.
+# fs__read_file) and evaluated by the DFA under that namespaced name.
+# Bare names (read_file) remain callable while exactly one backend serves
+# them; a bare name shared by several backends is rejected as ambiguous.
+#
+#   url             JSON-RPC endpoint (overridden by the url_env variable)
+#   capabilities    DFA states the backend may expose; discovered tools
+#                   classified outside this set are quarantined as UNKNOWN
+#   sandbox_roots   prefixes that every path argument must stay within
+#   path_arguments  argument names (string or list) checked against roots
+#   scan_responses  run the ingest scanner on LOCAL_READ/UNTRUSTED_INGEST/
+#                   NETWORK_EGRESS responses (alert only: a match is logged in
+#                   telemetry and never changes labels or DFA state)
+#   url_arguments   argument names checked against egress (default: [url])
+#   egress          outbound URL policy: schemes, exact-host allowlist, and
+#                   private_hosts (allowlisted hosts that may resolve to
+#                   private addresses).  Loopback, link-local and metadata
+#                   addresses are always refused.  Also enforced on every
+#                   request (incl. redirects) by the egress guard.
+#   tools           explicit upstream tool name -> DFA state mappings
+default_backend: fs
+
+backends:
+  fs:  # @modelcontextprotocol/server-filesystem
+    url: http://unprotected:9000/mcp
+    url_env: MCP_FILESYSTEM_URL
+    capabilities: [DISCOVERY, LOCAL_READ, LOCAL_WRITE]
+    sandbox_roots:
+      - /mcp-proxy-testbed/sandbox
+      - /sandbox
+    path_arguments: [path, paths, source, destination]
+    scan_responses: true
+    tools:
+      list_allowed_directories: DISCOVERY
+      list_directory: DISCOVERY
+      list_directory_with_sizes: DISCOVERY
+      directory_tree: DISCOVERY
+      search_files: DISCOVERY
+      read_file: LOCAL_READ
+      read_text_file: LOCAL_READ
+      read_media_file: LOCAL_READ
+      read_multiple_files: LOCAL_READ
+      get_file_info: LOCAL_READ
+      write_file: LOCAL_WRITE
+      edit_file: LOCAL_WRITE
+      create_directory: LOCAL_WRITE
+      move_file: LOCAL_WRITE
+
+  web:  # mcp-server-fetch
+    url: http://fetch-backend:9001/mcp
+    url_env: MCP_FETCH_URL
+    capabilities: [LOCAL_READ, NETWORK_EGRESS, UNTRUSTED_INGEST]
+    scan_responses: true
+    egress:
+      schemes: [http, https]
+      allowed_hosts:
+        - fetch-backend                 # testbed fixture server
+        # Public read-only sites (live profile only).  Exact host match.
+        - en.wikipedia.org              # encyclopedia articles (HTML)
+        - docs.python.org               # technical documentation (HTML)
+        - api.github.com                # public REST API (JSON, no auth)
+        - jsonplaceholder.typicode.com  # fake REST API for testing (JSON)
+        - httpbin.org                   # HTTP test service: redirects, echoed content
+      # private_hosts stays limited to the fixture server: every public host
+      # above must resolve to a public address or the request is refused.
+      private_hosts:
+        - fetch-backend      # internal Docker address
+    tools:
+      # Outbound request: the URL itself can carry data off-host, so fetch
+      # is egress.  Every response is external content and labels the
+      # session untrusted (labels.sources.untrusted.tools), whatever it says.
+      fetch: NETWORK_EGRESS
+
+# ----------------------------------------------------------------------------
+# Global tool mappings
+# ----------------------------------------------------------------------------
+# Un-namespaced mappings for tools not owned by a registered backend.  These
+# route to default_backend and always take precedence over bare aliases.
+tool_mappings:
+  # Discovery tools
+  list_tools: DISCOVERY
+
+  # Untrusted external data ingestion (also untrusted sources by tool label)
+  browser_action: UNTRUSTED_INGEST
+  web_search: UNTRUSTED_INGEST
+  scrape_url: UNTRUSTED_INGEST
+
+  # Privileged execution
+  execute_command: EXECUTE
+  bash: EXECUTE
+  run_script: EXECUTE
+
+  # Network egress (data exfiltration surface)
+  send_webhook: NETWORK_EGRESS
+  upload_file: NETWORK_EGRESS
+  send_email: NETWORK_EGRESS
+
+# ----------------------------------------------------------------------------
+# Provenance labels (information flow control)
+# ----------------------------------------------------------------------------
+# A session is labeled by WHERE its data came from, never by what it says.
+# Labels are sticky: they only accumulate, and only a session reset or TTL
+# expiry clears them.
+#
+#   sources            label -> {axis, tools, paths}
+#                      tools: every response of these canonical tools
+#                      paths: globs over the canonical realpath of each path
+#                             argument ("**" spans segments, "*" stays in one;
+#                             no leading "/" = match anywhere in the path)
+#   path_label_states  DFA states whose path arguments carry path labels
+#                      (LOCAL_WRITE included: edit_file returns a diff of the
+#                      file it edits)
+#   sinks              DFA states each label may not reach.  Checked before
+#                      the transition graph; a block returns -32001 with the
+#                      session's labels and their origins.
+#   file_labels        a LOCAL_WRITE by a labeled session (write_file,
+#                      edit_file, create_directory, move_file) stores its
+#                      labels on the canonical destination path; move_file
+#                      also carries the source path's labels.  Later reads of
+#                      the path (or anything under it) get those labels.
+#                      Persisted as JSON at store_path (env override:
+#                      MCP_FILE_LABEL_STORE).  Not covered: writes through
+#                      tools the proxy does not classify as LOCAL_WRITE, and
+#                      files changed outside the proxy.
+#   value_tracking     secondary defense: fragments of secret-looking values
+#                      read from a tracked source are refused in later calls
+#                      into these sinks.  Encoding or paraphrase evades it;
+#                      the labels are the guarantee.
+labels:
+  sources:
+    untrusted:
+      axis: integrity
+      tools:
+        - web__fetch        # every fetched page, whatever it says
+        - browser_action
+        - web_search
+        - scrape_url
+      paths:
+        - sandbox/**/inbox/**
+    secret:
+      axis: confidentiality
+      paths:
+        - "**/secrets/**"
+        - "**/*.env"
+        - "**/credentials*"
+
+  path_label_states: [LOCAL_READ, DISCOVERY, LOCAL_WRITE]
+
+  file_labels:
+    store_path: /app/state/file_labels.json   # proxy-state volume (docker-compose.yml)
+    source_arguments: [source]                # move_file: carry these paths' labels
+
+  sinks:
+    - label: untrusted
+      # Strict: an untrusted session cannot fetch again either.  To allow
+      # repeat fetches, drop NETWORK_EGRESS from this list.
+      block: [LOCAL_WRITE, EXECUTE, NETWORK_EGRESS]
+      reason: >-
+        Session holds untrusted-origin data; it cannot drive file writes,
+        command execution or network egress (indirect prompt injection).
+    - label: secret
+      block: [NETWORK_EGRESS, EXECUTE]
+      reason: >-
+        Session holds secret-origin data; it cannot reach network egress or
+        command execution (exfiltration).
+
+  value_tracking:
+    enabled: true
+    labels: [secret]
+    sinks: [NETWORK_EGRESS, EXECUTE]
+    fragment_length: 7          # same window as the eval's canary fragment check
+    min_value_length: 8
+    max_fragments_per_session: 4096
+
+# ----------------------------------------------------------------------------
+# Layer 1 argument limits (rejected before forwarding)
+# ----------------------------------------------------------------------------
+# Arguments must be an object; path/URL arguments must be strings (or lists
+# of strings); values must match the tool's inputSchema types once the proxy
+# has seen it via tools/list.
+argument_limits:
+  max_path_length: 4096       # PATH_MAX
+  max_url_length: 8192
+  max_total_bytes: 1048576    # serialized arguments, 1 MiB
+
+# Directed edges in the DFA.  from_state -> [to_states]
+# Any transition NOT listed here is denied by default.
+allowed_transitions:
+  START:
+    - DISCOVERY
+    - LOCAL_READ
+    - LOCAL_WRITE  # writing first is a normal session (create, rename, generate)
+    - UNTRUSTED_INGEST
+    - NETWORK_EGRESS  # fetch safety comes from the backend egress policy (URL allowlist)
+
+  DISCOVERY:
+    - DISCOVERY
+    - LOCAL_READ
+    - LOCAL_WRITE
+    - EXECUTE
+    - UNTRUSTED_INGEST
+    - NETWORK_EGRESS
+
+  LOCAL_READ:
+    - LOCAL_READ
+    - LOCAL_WRITE
+    - EXECUTE
+    - DISCOVERY
+    - UNTRUSTED_INGEST
+    - NETWORK_EGRESS
+
+  LOCAL_WRITE:
+    - DISCOVERY
+    - LOCAL_READ
+    - LOCAL_WRITE
+    - EXECUTE
+
+  UNTRUSTED_INGEST:
+    - DISCOVERY
+    - LOCAL_READ
+    # Note: LOCAL_WRITE, EXECUTE, and NETWORK_EGRESS are deliberately
+    # omitted here to block indirect prompt injection at the transition
+    # layer. The forbidden_invariants below provide a second explicit
+    # enforcement layer with detailed audit reasons.
+
+  EXECUTE:
+    - DISCOVERY
+    - LOCAL_READ
+    - LOCAL_WRITE
+    - EXECUTE
+
+  NETWORK_EGRESS:
+    - DISCOVERY
+    - LOCAL_READ
+    - NETWORK_EGRESS  # consecutive outbound calls; label sinks still apply
+    # Reachable only by an egress tool that is not an untrusted source:
+    # every fetch labels the session untrusted, and the untrusted sink rule
+    # blocks LOCAL_WRITE before this graph is consulted.
+    - LOCAL_WRITE
+
+# Invariant rules that trigger fatal violations regardless of allowed_transitions.
+# These model hard security boundaries against indirect prompt injection.
+forbidden_invariants:
+  - from_state: UNTRUSTED_INGEST
+    to_state: LOCAL_WRITE
+    reason: >-
+      Untrusted ingestion cannot directly mutate local files
+      (mitigating indirect prompt injection).
+    unless_visited: []
+
+  - from_state: UNTRUSTED_INGEST
+    to_state: EXECUTE
+    reason: >-
+      Untrusted ingestion cannot trigger command execution
+      (mitigating confused deputy).
+    unless_visited: []
+
+  - from_state: UNTRUSTED_INGEST
+    to_state: NETWORK_EGRESS
+    reason: >-
+      Untrusted ingestion cannot exfiltrate data over external
+      network.
+    unless_visited: []

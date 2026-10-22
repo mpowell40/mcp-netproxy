@@ -1,0 +1,9 @@
+# PHASE 5 LIVE-INTERNET overlay. Switches the proxy to
+# config/policy.phase5.live.yaml: the Phase 5 provenance-label policy plus
+# the live set's public read-only hosts.
+#   docker compose -f docker-compose.yml -f compose/phase5-live.yml up -d
+# Drop this file from the command to return to config/policy.yaml.
+services:
+  protected:
+    environment:
+      - POLICY_PATH=/app/config/policy.phase5.live.yaml

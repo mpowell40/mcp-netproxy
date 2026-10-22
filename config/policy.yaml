@@ -83,7 +83,7 @@ tool_mappings:
   # Discovery tools
   list_tools: DISCOVERY
 
-  # Untrusted external data ingestion (unconditional static taint)
+  # Untrusted external data ingestion (also untrusted sources by tool label)
   browser_action: UNTRUSTED_INGEST
   web_search: UNTRUSTED_INGEST
   scrape_url: UNTRUSTED_INGEST
