@@ -63,7 +63,11 @@ _DEFAULT_POLICY = pathlib.Path(__file__).resolve().parent.parent / "config" / "p
 # Heuristic inspection patterns (Layer 1).  Path traversal is decided by the
 # canonicalizing sandbox check, not by matching "../" in the raw arguments.
 SENSITIVE_PATH_PATTERN = r"(/etc/|~/\.ssh|~/\.env)"
+# Shell metacharacters only matter where a shell may interpret them, so this
+# check runs only for tools mapped to EXECUTE.  File contents, URLs and
+# search queries legitimately contain ';', '|', "curl" or "bash".
 SHELL_INJECTION = r"(;|\||\&\&|\bcurl\b|\bbash\b)"
+_SHELL_CHECKED_STATES = {ToolState.EXECUTE}
 AWS_KEY_PATTERN = r"(AKIA[0-9A-Z]{16})"
 
 # Namespace that ``fetch_downstream_url`` overrides (legacy create_app kwarg)
@@ -241,7 +245,10 @@ def create_app(
 
         # -- Layer 1: Heuristic & Scope Boundary inspection -------------
         is_sensitive_path = bool(re.search(SENSITIVE_PATH_PATTERN, arg_string))
-        is_shell = bool(re.search(SHELL_INJECTION, arg_string))
+        is_shell = (
+            _policy.resolve_state(resolved.canonical, arguments) in _SHELL_CHECKED_STATES
+            and bool(re.search(SHELL_INJECTION, arg_string))
+        )
         is_aws_key = bool(re.search(AWS_KEY_PATTERN, arg_string))
 
         # Scope boundary check: path arguments must stay inside the backend sandbox

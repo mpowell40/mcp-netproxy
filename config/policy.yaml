@@ -235,6 +235,7 @@ allowed_transitions:
   NETWORK_EGRESS:
     - DISCOVERY
     - LOCAL_READ
+    - NETWORK_EGRESS  # consecutive outbound calls; label sinks still apply
     # Reachable only by an egress tool that is not an untrusted source:
     # every fetch labels the session untrusted, and the untrusted sink rule
     # blocks LOCAL_WRITE before this graph is consulted.

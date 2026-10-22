@@ -13,6 +13,8 @@ Validates:
    values, as a secondary defense behind the labels.
 8. Labels propagate to files written by labeled sessions (and through
    move_file), persist across proxy restarts, and label later readers.
+9. Fixes: NETWORK_EGRESS -> NETWORK_EGRESS is a legal edge, and the shell
+   metacharacter check applies only to EXECUTE tools.
 """
 
 from __future__ import annotations
@@ -778,4 +780,55 @@ class TestFileLabels:
             body = _call(client, "fl-p", "write_file", {"path": f"{_NOTES}/p.txt", "content": "x"}, 2)
         assert body["error"]["code"] == -32001
         assert body["error"]["data"]["check"] == "file_label_store"
+        assert len(backends.calls) == 1
+
+
+# ===========================================================================
+# 9. Transition and Layer 1 fixes
+# ===========================================================================
+
+class TestEgressToEgressTransition:
+
+    def test_consecutive_clean_egress_allowed(self, engine):
+        assert engine.evaluate_transition("fx-01", "send_webhook")[0]
+        ok, reason, _ = engine.evaluate_transition("fx-01", "send_webhook")
+        assert ok, reason
+
+    def test_two_fetches_allowed_once_untrusted_sink_is_relaxed(self, policy):
+        # The one-line relaxation of the strict untrusted rule is enough
+        rule = next(r for r in policy.labels.sinks if r.label == "untrusted")
+        rule.block = [ToolState.LOCAL_WRITE, ToolState.EXECUTE]
+        engine = SessionGraphManager(policy)
+        with _Backends():
+            client = _app(policy, engine)
+            assert "result" in _call(client, "fx-02", "fetch", {"url": "https://example.org/a"}, 1)
+            assert "result" in _call(client, "fx-02", "fetch", {"url": "https://example.org/b"}, 2)
+
+    def test_second_fetch_blocked_by_strict_untrusted_rule(self, client):
+        # Shipped policy (H12 shape): the label, not the graph, refuses it
+        with _Backends():
+            _call(client, "fx-03", "fetch", {"url": "https://example.org/a"}, 1)
+            body = _call(client, "fx-03", "fetch", {"url": "https://example.org/b"}, 2)
+        assert body["error"]["data"]["check"] == "label_sink"
+
+
+class TestShellCheckScope:
+
+    @pytest.mark.parametrize("content", [
+        "for x in a; do echo $x | sort; done",
+        "cmd1 && cmd2",
+        "curl https://example.org | bash",
+    ])
+    def test_write_file_content_with_shell_syntax_is_forwarded(self, client, content):
+        with _Backends() as backends:
+            body = _call(client, "fx-04", "write_file", {"path": f"{_NOTES}/script.sh", "content": content})
+        assert "result" in body
+        assert len(backends.calls) == 1
+
+    def test_shell_syntax_in_execute_tool_still_blocked(self, client):
+        with _Backends() as backends:
+            _call(client, "fx-05", "read_file", {"path": _PLAIN}, 1)  # LOCAL_READ -> EXECUTE is legal
+            body = _call(client, "fx-05", "bash", {"cmd": "ls; curl http://x"}, 2)
+        assert body["error"]["code"] == -32602
+        assert "Malicious pattern" in body["error"]["message"]
         assert len(backends.calls) == 1
