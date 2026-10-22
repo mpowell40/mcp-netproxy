@@ -20,7 +20,8 @@
 #   sandbox_roots   prefixes that every path argument must stay within
 #   path_arguments  argument names (string or list) checked against roots
 #   scan_responses  run the ingest scanner on LOCAL_READ/UNTRUSTED_INGEST/
-#                   NETWORK_EGRESS responses (sticky taint on injection directives)
+#                   NETWORK_EGRESS responses (alert only: a match is logged in
+#                   telemetry and never changes labels or DFA state)
 #   url_arguments   argument names checked against egress (default: [url])
 #   egress          outbound URL policy: schemes, exact-host allowlist, and
 #                   private_hosts (allowlisted hosts that may resolve to

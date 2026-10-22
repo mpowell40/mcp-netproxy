@@ -8,7 +8,7 @@ Validates:
 4. Idle sessions expire after the configured TTL.
 5. Concurrent sessions never share taint or DFA state.
 6. Calls within one session are serialized, so a call cannot slip past a
-   taint that an in-flight response is about to latch.
+   label that an in-flight response is about to apply.
 """
 
 from __future__ import annotations
@@ -141,7 +141,7 @@ class TestCheckpointEvents:
         assert before.current_state == "START"
         assert before.details["target_state"] == "LOCAL_READ"
         assert after.current_state == "LOCAL_READ"
-        assert after.details == {"scanned": True, "tainted": False, "status_code": 200}
+        assert after.details == {"scanned": True, "status_code": 200}
         assert before.request_id == after.request_id == 7
         for ev in evs:
             assert self._REQUIRED <= ev.to_dict().keys()
@@ -319,7 +319,7 @@ class TestSessionExpiry:
     def test_idle_session_expires(self, policy):
         clock = _FakeClock()
         engine = SessionGraphManager(policy, session_ttl=10, clock=clock)
-        engine.taint_session("ttl-01")
+        engine.label("ttl-01", "untrusted")
         clock.now += 11
         assert engine.peek_state("ttl-01") is ToolState.START
         assert engine.get_session_context("ttl-01") is None
@@ -329,7 +329,7 @@ class TestSessionExpiry:
     def test_activity_refreshes_ttl(self, policy):
         clock = _FakeClock()
         engine = SessionGraphManager(policy, session_ttl=10, clock=clock)
-        engine.taint_session("ttl-02")
+        engine.label("ttl-02", "untrusted")
         for _ in range(5):
             clock.now += 8
             engine.evaluate_transition("ttl-02", "fs__read_file")
@@ -350,10 +350,12 @@ class TestSessionExpiry:
     def test_zero_ttl_disables_expiry(self, policy):
         clock = _FakeClock()
         engine = SessionGraphManager(policy, session_ttl=0, clock=clock)
-        engine.taint_session("ttl-03")
+        engine.label("ttl-03", "untrusted")
+        engine.evaluate_transition("ttl-03", "fs__read_file")
         clock.now += 10**9
         assert engine.purge_expired() == 0
-        assert engine.peek_state("ttl-03") is ToolState.UNTRUSTED_INGEST
+        assert engine.peek_state("ttl-03") is ToolState.LOCAL_READ
+        assert engine.get_session_context("ttl-03")["labels"].keys() == {"untrusted"}
 
 
 # ===========================================================================
@@ -394,8 +396,8 @@ class TestSessionIsolation:
                 assert last.status == "ALLOWED"
                 assert session.current_state is ToolState.LOCAL_WRITE
 
-    def test_in_flight_taint_blocks_concurrent_call(self, app):
-        """A write sent while a poisoned fetch is in flight must see its taint."""
+    def test_in_flight_label_blocks_concurrent_call(self, app):
+        """A write sent while a fetch is in flight must see the fetch's label."""
         fs_calls: list[dict] = []
 
         async def scenario() -> list[dict]:
@@ -433,5 +435,6 @@ class TestSessionIsolation:
         fetch_body, write_body = asyncio.run(scenario())
         assert "result" in fetch_body
         assert write_body["error"]["code"] == -32001
-        assert write_body["error"]["data"]["current_state"] == "UNTRUSTED_INGEST"
+        assert write_body["error"]["data"]["current_state"] == "NETWORK_EGRESS"
+        assert write_body["error"]["data"]["check"] == "label_sink"
         assert fs_calls == []

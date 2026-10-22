@@ -195,7 +195,7 @@ class BackendRegistry:
         return None
 
     def should_scan(self, resolved: ResolvedTool, state: ToolState) -> bool:
-        """Whether the response to this call goes through the ingest scanner."""
+        """Whether the response to this call goes through the (alert-only) ingest scanner."""
         if resolved.namespace is None:
             return False
         return self.backend(resolved.namespace).scan_responses and state in _SCANNED_STATES

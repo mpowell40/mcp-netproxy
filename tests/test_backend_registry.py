@@ -8,7 +8,7 @@ Validates:
    and forwards the upstream (un-namespaced) tool name.
 4. Discovered tools outside a backend's capabilities are quarantined.
 5. Per-backend sandbox roots apply to every configured path argument.
-6. Per-backend ``scan_responses`` gates the ingest scanner.
+6. Per-backend ``scan_responses`` gates the (alert-only) ingest scanner.
 """
 
 from __future__ import annotations
@@ -388,10 +388,10 @@ class TestScanResponsesFlag:
         with _MockBackends({_WEB_URL: lambda req: _result(req["id"], _INJECTION_TEXT)}):
             client.post("/mcp", json=_tool_call("fetch", {"url": "http://evil.example"}), headers={"X-Session-ID": sid})
 
-    def test_scanning_enabled_taints_session(self, client, engine):
+    def test_scanning_enabled_raises_alert(self, client, engine):
         self._fetch_injection(client, "scan-on-01")
         session, _ = engine._get_session("scan-on-01")
-        assert session.is_tainted is True
+        assert [a["pattern_id"] for a in session.alerts] == ["AGENT_TARGET_HEADER"]
 
     def test_scanning_disabled_still_labels_by_provenance(self, client, policy, engine):
         # The scanner is no longer what labels a session: fetch is untrusted
@@ -400,3 +400,4 @@ class TestScanResponsesFlag:
         self._fetch_injection(client, "scan-off-01")
         session, _ = engine._get_session("scan-off-01")
         assert {o.rule for o in session.labels["untrusted"]} == {"tool:web__fetch"}
+        assert session.alerts == []

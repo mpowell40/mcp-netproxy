@@ -1,7 +1,8 @@
 """mcp-netproxy: Zero Trust Policy Enforcement Point for MCP tool calls.
 
-Combines regex-based heuristic inspection with Behavioral State-Machine
-Invariant Enforcement and Egress Response Scanning across multiple
+Combines regex-based heuristic inspection, provenance-based information
+flow control (sticky ``untrusted`` / ``secret`` session labels) and
+Behavioral State-Machine Invariant Enforcement across multiple
 downstream MCP backends declared in the ``backends:`` registry of
 ``config/policy.yaml`` (e.g., Filesystem MCP as ``fs``, Fetch MCP as ``web``).
 
@@ -13,9 +14,9 @@ previously-unseen tools.
 
 Every frame emits structured ``ProxyEvent`` telemetry at the
 BEFORE/AFTER_TOOL_LIST and BEFORE/AFTER_TOOL_CALL checkpoints.  Calls
-within one session are serialized end-to-end (DFA check -> forward ->
-response scan) so a call cannot slip past a taint that an in-flight
-response is about to latch.
+within one session are serialized end-to-end (label/DFA check -> forward
+-> labeling) so a call cannot slip past a label that an in-flight
+response is about to apply.  The ingest scanner only raises alerts.
 """
 
 from __future__ import annotations
@@ -194,9 +195,9 @@ def create_app(
                 return _jsonrpc_error(request_id, -32601, "No backend registered", status=200)
             return await _forward(payload, _registry.url(default_ns), app.state.http_client)
 
-        # -- Serialize this session's calls across check -> forward -> scan --
-        # Without this, a second call evaluated while a scanned response is
-        # still in flight would miss the taint that response is about to latch.
+        # -- Serialize this session's calls across check -> forward -> label --
+        # Without this, a second call evaluated while a response is still in
+        # flight would miss the labels that response is about to apply.
         async with _session_gate(session_id):
             return await _handle_tool_call(payload, session_id)
 
@@ -332,7 +333,7 @@ def create_app(
         upstream_payload = {**payload, "params": {**params, "name": resolved.upstream}}
         response = await _forward(upstream_payload, target_backend, app.state.http_client)
 
-        after: dict[str, Any] = {"scanned": False, "tainted": False, "status_code": response.status_code}
+        after: dict[str, Any] = {"scanned": False, "status_code": response.status_code}
 
         # -- Provenance labels --------------------------------------------
         # Whatever the backend returned (results, JSON-RPC errors, isError
@@ -347,9 +348,11 @@ def create_app(
                     f"{sorted({o.label for o in applied})} by '{resolved.canonical}'"
                 )
 
-        # -- Layer 3: Dynamic Ingest Scanner (response inspection) --------
+        # -- Layer 3: Ingest Scanner (alert only) --------------------------
         # For content-returning tools on backends with scan_responses enabled,
-        # scan the response payload for imperative prompt-injection directives.
+        # scan the response for imperative prompt-injection directives.  A
+        # match is an alert for operators: it never changes the session's
+        # labels or DFA state (wording is evadable; provenance decides).
         if _registry.should_scan(resolved, ToolState(meta["to_state"])):
             after["scanned"] = True
             try:
@@ -367,27 +370,19 @@ def create_app(
                 if full_text.strip():
                     scan_result = scan_payload_for_untrusted_directives(full_text)
                     if scan_result.is_untrusted:
-                        # Retroactively taint the session with sticky latch
-                        taint_source = describe_source(resolved.canonical, arguments)
-                        _engine.taint_session(
-                            session_id,
-                            ToolState.UNTRUSTED_INGEST,
-                            taint_source=taint_source,
-                            trigger_pattern=scan_result.pattern_id,
-                            reason=scan_result.reason,
-                        )
-                        after.update(
-                            tainted=True,
-                            taint_source=taint_source,
-                            trigger_pattern=scan_result.pattern_id,
-                            reason=scan_result.reason,
-                        )
+                        alert = {
+                            "pattern_id": scan_result.pattern_id,
+                            "source": describe_source(resolved.canonical, arguments),
+                            "reason": scan_result.reason,
+                        }
+                        _engine.record_alert(session_id, alert)
+                        after["alerts"] = [alert]
                         logger.warning(
-                            f"[DYNAMIC INGEST SCANNER] Session '{session_id}' tainted "
-                            f"with UNTRUSTED_INGEST from tool '{resolved.canonical}'. Reason: {scan_result.reason}"
+                            f"[INGEST SCANNER ALERT] Session '{session_id}': {scan_result.pattern_id} "
+                            f"in response from '{alert['source']}' (alert only; labels unchanged)"
                         )
             except Exception as exc:
-                # Non-parseable response — leave session state as-is
+                # Non-parseable response: nothing to scan
                 after["scan_error"] = type(exc).__name__
 
         _emit(Checkpoint.AFTER_TOOL_CALL, session_id, resolved.canonical, Decision.ALLOW, request_id, **after)

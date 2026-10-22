@@ -199,6 +199,7 @@ class BackendConfig(BaseModel):
             checked against ``sandbox_roots``.
         scan_responses: Run the ingest scanner over LOCAL_READ /
             UNTRUSTED_INGEST / NETWORK_EGRESS responses from this backend.
+            Matches are alerts only; they never change labels or state.
         url_arguments: Argument names checked against ``egress``.
         egress: Outbound URL policy; None disables the URL check.
         tools: Explicit upstream-tool-name -> ToolState mappings.

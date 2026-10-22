@@ -30,6 +30,7 @@ logger = logging.getLogger("mcp-netproxy")
 DEFAULT_SESSION_TTL = 3600.0  # seconds of inactivity before a session is evicted
 DEFAULT_MAX_HISTORY = 1024  # per-session bound on transition / trajectory records
 MAX_LABEL_ORIGINS = 32  # per-session, per-label bound on recorded label origins
+MAX_ALERTS = 32  # per-session bound on recorded scanner alerts
 
 __all__ = ["SessionGraphManager", "SessionState", "describe_source", "DEFAULT_SESSION_TTL"]
 
@@ -73,6 +74,9 @@ class SessionState:
     # the label set is the key set, so the origin bound never clears a label.
     labels: dict[str, list[LabelOrigin]] = field(default_factory=dict)
     label_origins_dropped: int = 0
+    # Ingest scanner alerts: telemetry only, never an input to enforcement.
+    alerts: list[dict[str, Any]] = field(default_factory=list)
+    alerts_dropped: int = 0
     created_at: float = field(default_factory=time.time)
     last_seen: float = 0.0  # engine clock (monotonic), used for TTL expiry
 
@@ -349,6 +353,8 @@ class SessionGraphManager:
                 "is_tainted": session.is_tainted,
                 "labels": session.labels_dict(),
                 "label_origins_dropped": session.label_origins_dropped,
+                "alerts": list(session.alerts),
+                "alerts_dropped": session.alerts_dropped,
                 "state_history": [
                     {"timestamp": e.timestamp, "state": e.state.value, "tool_invoked": e.tool_invoked}
                     for e in session.state_history
@@ -358,30 +364,18 @@ class SessionGraphManager:
                 "session_ttl": self._session_ttl,
             }
 
-    def taint_session(
-        self,
-        session_id: str,
-        taint_state: ToolState = ToolState.UNTRUSTED_INGEST,
-        *,
-        taint_source: str = "[dynamic_ingest_scan]",
-        trigger_pattern: str = "UNSPECIFIED",
-        reason: str = "Session tainted by dynamic response scanner",
-    ) -> None:
-        """Mark a session untrusted from a scanner verdict (transitional).
+    def record_alert(self, session_id: str, alert: dict[str, Any]) -> None:
+        """Record an ingest-scanner alert for operators.
 
-        Records an ``untrusted`` label whose rule names the scanner pattern
-        and moves the DFA to *taint_state*.  Removed once the scanner is
-        demoted to alert-only.
+        Alerts are telemetry: they never change the session's labels or
+        DFA state.
         """
         session, slock = self._get_session(session_id)
         with slock:
-            from_state = session.current_state
-            session.add_label(LabelOrigin("untrusted", taint_source, f"scanner:{trigger_pattern}"))
-            session.current_state = taint_state
-            session.visited_states.add(taint_state)
-            self._record(
-                session, "[dynamic_ingest_scan]", from_state, taint_state, "ALLOWED", reason
-            )
+            if len(session.alerts) < MAX_ALERTS:
+                session.alerts.append({**alert, "timestamp": time.time()})
+            else:
+                session.alerts_dropped += 1
 
     def reset_session(self, session_id: str) -> None:
         """Reset a session back to START state."""

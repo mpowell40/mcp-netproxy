@@ -399,7 +399,8 @@ class TestNonToolCallPassthrough:
 
 class TestDynamicIngestScanner:
     """Verify that the ingest scanner detects imperative directives in read
-    responses and retroactively taints the session to UNTRUSTED_INGEST.
+    responses and records an alert, without labeling the session or moving
+    the DFA (provenance, not wording, decides enforcement).
     """
 
     def test_scanner_detects_imperative_directive(self):
@@ -455,10 +456,11 @@ class TestDynamicIngestScanner:
         result = scan_payload_for_untrusted_directives("")
         assert result.is_untrusted is False
 
-    def test_tainted_response_blocks_subsequent_write(self, app_client, engine):
-        """End-to-end: reading a file with injection directives taints the
-        session via content scanning.  A subsequent write to a valid
-        sandbox path is blocked by the DFA invariant (-32001).
+    def test_injection_text_in_unlabeled_file_alerts_but_does_not_block(self, app_client, engine):
+        """End-to-end: reading an unlabeled file whose text contains injection
+        directives records a scanner alert, but the session stays unlabeled
+        and in LOCAL_READ, so a subsequent write is forwarded.  (Phase 4
+        tainted the session here; Phase 5 decides by provenance only.)
 
         This test mocks the downstream response to return injection content.
         """
@@ -514,31 +516,36 @@ class TestDynamicIngestScanner:
             body1 = resp1.json()
             assert "result" in body1
 
-        # Verify session was tainted by the ingest scanner
+        # The scanner raised an alert, and nothing else changed
         session, _ = engine._get_session(sid)
-        assert session.current_state.value == "UNTRUSTED_INGEST"
+        assert session.current_state.value == "LOCAL_READ"
+        assert session.label_set == frozenset()
+        (alert,) = session.alerts
+        assert alert["pattern_id"] == "HEADER_DIRECTIVE"
+        assert alert["source"] == "fs__read_text_file:/mcp-proxy-testbed/sandbox/note_layer2_write.txt"
 
-        # Step 2: Attempt write to valid sandbox path — DFA blocks it
-        resp2 = app_client.post(
-            "/mcp",
-            json=_jsonrpc_tool_call(
-                "write_file",
-                {
-                    "path": "/mcp-proxy-testbed/sandbox/build_status.txt",
-                    "content": "Status: Build Compromised",
-                },
-                req_id=2,
-            ),
-            headers={"X-Session-ID": sid},
-        )
+        # Step 2: Write to valid sandbox path is forwarded (no label, legal edge)
+        with patch("src.main.httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.post.return_value = mock_resp
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            resp2 = app_client.post(
+                "/mcp",
+                json=_jsonrpc_tool_call(
+                    "write_file",
+                    {
+                        "path": "/mcp-proxy-testbed/sandbox/build_status.txt",
+                        "content": "Status: Build Compromised",
+                    },
+                    req_id=2,
+                ),
+                headers={"X-Session-ID": sid},
+            )
         assert resp2.status_code == 200
-        body2 = resp2.json()
-        assert body2["jsonrpc"] == "2.0"
-        assert body2["id"] == 2
-        assert body2["error"]["code"] == -32001
-        assert "Security Invariant Violation" in body2["error"]["message"]
-        assert body2["error"]["data"]["current_state"] == "UNTRUSTED_INGEST"
-        assert body2["error"]["data"]["target_state"] == "LOCAL_WRITE"
+        assert "error" not in resp2.json()
 
     def test_clean_response_does_not_taint(self, app_client, engine):
         """Reading a file with clean content keeps the session in LOCAL_READ.
@@ -800,8 +807,8 @@ class TestMultiServerCrossBackendDefense:
     - tools/call routes fetch to :9001 and filesystem tools to :9000.
     - Any HTML fetch, however clean, labels the session untrusted, so a
       following write_file is blocked (provenance, not content).
-    - Poisoned HTML fetch (portal_update.html) triggers ingest_scanner.py,
-      latches session.is_tainted = True, and blocks subsequent write_file with -32001.
+    - Poisoned HTML fetch (portal_update.html) raises a scanner alert; the
+      fetch's own untrusted label blocks the subsequent write_file with -32001.
     """
 
     _FIXTURES_DIR = _PROJECT_ROOT / "backends" / "fetch" / "fixtures"
@@ -958,10 +965,10 @@ class TestMultiServerCrossBackendDefense:
         # The fetch reached :9001; the write never reached :9000
         assert routed_urls == ["http://fetch-backend:9001/mcp"]
 
-    def test_poisoned_html_fetch_triggers_scanner_taint_and_blocks_write_file(self, policy, engine):
-        """Poisoned Path: Fetching portal_update.html (:9001) triggers
-        ingest_scanner.py, latches session.is_tainted = True, and intercepts
-        the subsequent write_file (:9000) with JSON-RPC error -32001.
+    def test_poisoned_html_fetch_alerts_and_label_blocks_write_file(self, policy, engine):
+        """Poisoned Path: Fetching portal_update.html (:9001) raises a scanner
+        alert; the session is untrusted because it fetched (not because of
+        the alert), and the subsequent write_file (:9000) gets -32001.
         """
         from unittest.mock import AsyncMock, patch
         from fastapi.testclient import TestClient
@@ -1015,10 +1022,11 @@ class TestMultiServerCrossBackendDefense:
             assert resp1.status_code == 200
             assert "result" in resp1.json()
 
-            # Verify ingest_scanner.py latched session.is_tainted = True and set UNTRUSTED_INGEST
+            # Labeled by provenance (tool rule), alerted by the scanner
             session, _ = engine._get_session(sid)
-            assert session.is_tainted is True
-            assert session.current_state == ToolState.UNTRUSTED_INGEST
+            assert {o.rule for o in session.labels["untrusted"]} == {"tool:web__fetch"}
+            assert session.current_state == ToolState.NETWORK_EGRESS
+            assert len(session.alerts) == 1
 
             # Step 2: Attempt cross-server confused deputy write_file to /sandbox/build_status.txt
             resp2 = client.post(
@@ -1039,8 +1047,9 @@ class TestMultiServerCrossBackendDefense:
             assert body2["id"] == 2
             assert body2["error"]["code"] == -32001
             assert "Security Invariant Violation" in body2["error"]["message"]
-            assert body2["error"]["data"]["current_state"] == "UNTRUSTED_INGEST"
+            assert body2["error"]["data"]["current_state"] == "NETWORK_EGRESS"
             assert body2["error"]["data"]["target_state"] == "LOCAL_WRITE"
+            assert body2["error"]["data"]["check"] == "label_sink"
 
         # Confirm only :9001 was contacted; :9000 never received the blocked write_file
         assert routed_urls == ["http://fetch-backend:9001/mcp"]
