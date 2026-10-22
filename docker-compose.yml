@@ -16,6 +16,9 @@ services:
       # Same path the filesystem backend serves, read-only, so the sandbox
       # check can resolve symlinks exactly as the backend will.
       - .:/mcp-proxy-testbed:ro
+      # Persistent file label store (labels.file_labels.store_path): labels
+      # that files inherited from the sessions that wrote them survive restarts.
+      - proxy-state:/app/state
     depends_on:
       - unprotected
       - fetch-backend
@@ -38,3 +41,6 @@ services:
       - EGRESS_PROXY_URL=http://protected:8081
     volumes:
       - .:/mcp-proxy-testbed
+
+volumes:
+  proxy-state:

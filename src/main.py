@@ -315,6 +315,20 @@ def create_app(
                 request_id, -32601, f"No backend serves tool '{tool_name}'", status=200
             )
         target_backend = _registry.url(resolved.namespace)
+
+        # -- File labels: propagate before forwarding (fail closed) ---------
+        try:
+            labeled_paths = _engine.record_write(session_id, resolved.canonical, arguments)
+        except OSError as exc:
+            reason = f"File label store unavailable: {exc}"
+            logger.error(f"[SECURITY BLOCKED - FILE LABELS] Session '{session_id}': {reason}")
+            block("dfa", reason, resolved.canonical, check="file_label_store")
+            return _jsonrpc_error(
+                request_id, -32001, "Security Invariant Violation",
+                data={"attempted_tool": resolved.canonical, "reason": reason, "check": "file_label_store"},
+                status=200,
+            )
+
         _emit(
             Checkpoint.BEFORE_TOOL_CALL,
             session_id,
@@ -325,6 +339,7 @@ def create_app(
             target_state=meta["to_state"],
             backend=resolved.namespace,
             upstream_tool=resolved.upstream,
+            **({"labeled_paths": labeled_paths} if labeled_paths else {}),
         )
         logger.info(
             f"[MULTI-BACKEND DISPATCH] Routing tool='{resolved.canonical}' for session='{session_id}' "

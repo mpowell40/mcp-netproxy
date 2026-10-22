@@ -11,6 +11,8 @@ Validates:
 6. The ingest scanner only raises alerts: it never labels or moves the DFA.
 7. Value tracking refuses outbound calls carrying fragments of secret
    values, as a secondary defense behind the labels.
+8. Labels propagate to files written by labeled sessions (and through
+   move_file), persist across proxy restarts, and label later readers.
 """
 
 from __future__ import annotations
@@ -225,8 +227,14 @@ class TestSourceLabels:
     def test_plain_file_is_unlabeled(self, resolver):
         assert resolver.source_labels("fs__read_text_file", ToolState.LOCAL_READ, {"path": _PLAIN}) == []
 
-    def test_writes_do_not_pick_up_path_labels(self, resolver):
-        # Writing into secrets/ returns no secret data to the session
+    def test_writes_pick_up_path_labels(self, resolver):
+        # edit_file answers with a diff of the file it edits, so writes into a
+        # labeled path label the session too (LOCAL_WRITE in path_label_states)
+        assert _labels(resolver.source_labels("fs__edit_file", ToolState.LOCAL_WRITE, {"path": _SECRET})) == {"secret"}
+
+    def test_states_outside_path_label_states_ignore_paths(self, policy):
+        policy.labels.path_label_states = [ToolState.LOCAL_READ]
+        resolver = LabelResolver(policy)
         assert resolver.source_labels("fs__write_file", ToolState.LOCAL_WRITE, {"path": _SECRET}) == []
 
 
@@ -618,3 +626,156 @@ class TestValueTracking:
         assert body["error"]["code"] == -32001
         assert body["error"]["data"]["check"] == "value_tracking"
         assert [url for url, _ in backends.calls] == [_FS_URL]
+
+
+# ===========================================================================
+# 8. File label propagation
+# ===========================================================================
+
+_NOTES = "/mcp-proxy-testbed/sandbox/eval/notes"
+
+
+def _app(policy, engine):
+    return TestClient(create_app(
+        policy_config=policy, graph_manager=engine, backend_urls={"fs": _FS_URL, "web": _WEB_URL},
+    ))
+
+
+class TestFileLabels:
+
+    def test_copy_secret_then_new_session_read_then_egress_blocked(self, client, engine):
+        copy = f"{_NOTES}/copy.txt"
+        with _Backends(_web_or_fs) as backends:
+            _call(client, "fl-a", "read_text_file", {"path": _SECRET}, 1)
+            wrote = _call(client, "fl-a", "write_file", {"path": copy, "content": "API_TOKEN=CANARY-SECRET-002"}, 2)
+            assert "result" in wrote  # secret does not block local writes
+
+            # A fresh session that never touched secrets/ reads the copy
+            _call(client, "fl-b", "read_text_file", {"path": copy}, 3)
+            body = _call(client, "fl-b", "fetch", {"url": "https://httpbin.org/anything?d=x"}, 4)
+        assert body["error"]["code"] == -32001
+        (origin,) = body["error"]["data"]["labels"]["secret"]
+        assert origin["rule"] == f"file:{copy}"
+        assert "fs__write_file" in origin["detail"] and "'fl-a'" in origin["detail"]
+        assert _WEB_URL not in [url for url, _ in backends.calls]
+
+    def test_move_out_of_secrets_keeps_secret_label(self, client, engine):
+        moved = f"{_NOTES}/moved.txt"
+        with _Backends(_web_or_fs) as backends:
+            # A clean session moves the file; it never reads it
+            mv = _call(client, "fl-c", "move_file", {"source": _SECRET, "destination": moved}, 1)
+            assert "result" in mv
+            _call(client, "fl-d", "read_text_file", {"path": moved}, 2)
+            body = _call(client, "fl-d", "fetch", {"url": "https://httpbin.org/anything"}, 3)
+        assert body["error"]["code"] == -32001
+        rules = {o["rule"] for o in body["error"]["data"]["labels"]["secret"]}
+        assert rules == {f"file:{moved}"}
+        assert _WEB_URL not in [url for url, _ in backends.calls]
+
+    def test_store_survives_proxy_restart(self, policy, tmp_path):
+        from src.engine.labels import FileLabelStore
+
+        store_path = str(tmp_path / "state" / "file_labels.json")
+        copy = f"{_NOTES}/restart.txt"
+
+        first = SessionGraphManager(policy, file_label_store=FileLabelStore(store_path))
+        with _Backends(_web_or_fs):
+            client = _app(policy, first)
+            _call(client, "fl-e", "read_text_file", {"path": _SECRET}, 1)
+            _call(client, "fl-e", "write_file", {"path": copy, "content": "x"}, 2)
+        assert pathlib.Path(store_path).exists()
+
+        # New proxy process: fresh engine, sessions gone, store reloaded from disk
+        second = SessionGraphManager(policy, file_label_store=FileLabelStore(store_path))
+        with _Backends(_web_or_fs) as backends:
+            client = _app(policy, second)
+            _call(client, "fl-e", "read_text_file", {"path": copy}, 1)
+            body = _call(client, "fl-e", "fetch", {"url": "https://httpbin.org/anything"}, 2)
+        assert body["error"]["code"] == -32001
+        assert body["error"]["data"]["labels"]["secret"][0]["rule"] == f"file:{copy}"
+        assert [url for url, _ in backends.calls] == [_FS_URL]
+
+    def test_clean_session_writes_record_nothing(self, client, engine):
+        with _Backends():
+            _call(client, "fl-f", "read_text_file", {"path": _PLAIN}, 1)
+            _call(client, "fl-f", "write_file", {"path": f"{_NOTES}/clean.txt", "content": "x"}, 2)
+        assert len(engine.file_labels) == 0
+
+    def test_store_is_persisted_as_json(self, engine):
+        import json, os
+
+        engine.label("fl-g", "secret", source="fs__read_text_file:/x/secrets/a", rule="path:**/secrets/**")
+        engine.record_write("fl-g", "fs__write_file", {"path": f"{_NOTES}/g.txt"})
+        data = json.loads(pathlib.Path(os.environ["MCP_FILE_LABEL_STORE"]).read_text())
+        assert data["version"] == 1
+        (key,) = data["paths"]
+        assert key.endswith("/sandbox/eval/notes/g.txt")
+        (entry,) = data["paths"][key]["secret"]
+        assert entry["written_by"] == f"fs__write_file:{_NOTES}/g.txt"
+        assert entry["session"] == "fl-g"
+        assert entry["rule"] == "path:**/secrets/**"
+
+    def test_path_labels_only_accumulate(self, engine):
+        target = f"{_NOTES}/acc.txt"
+        engine.label("fl-h1", "secret")
+        engine.record_write("fl-h1", "fs__write_file", {"path": target})
+        engine.label("fl-h2", "untrusted")
+        engine.record_write("fl-h2", "fs__write_file", {"path": target})
+        engine.record_write("fl-h3", "fs__write_file", {"path": target})  # clean overwrite
+        engine.record_source("fl-h4", "fs__read_text_file", {"path": target})
+        session, _ = engine._get_session("fl-h4")
+        assert session.label_set == {"secret", "untrusted"}
+
+    def test_labeled_directory_labels_its_contents(self, engine):
+        vault = f"{_NOTES}/vault"
+        engine.label("fl-i", "secret")
+        engine.record_write("fl-i", "fs__create_directory", {"path": vault})
+        engine.record_source("fl-j", "fs__read_text_file", {"path": f"{vault}/later/file.txt"})
+        session, _ = engine._get_session("fl-j")
+        assert session.label_set == {"secret"}
+        assert session.labels["secret"][0].rule == f"file:{vault}"
+
+    def test_move_directory_carries_stored_labels_of_children(self, engine):
+        src_dir, dst_dir = f"{_NOTES}/drafts", f"{_NOTES}/published"
+        engine.label("fl-k", "secret")
+        engine.record_write("fl-k", "fs__write_file", {"path": f"{src_dir}/key.txt"})
+        # A clean session renames the directory
+        engine.record_write("fl-l", "fs__move_file", {"source": src_dir, "destination": dst_dir})
+        engine.record_source("fl-m", "fs__read_text_file", {"path": f"{dst_dir}/key.txt"})
+        session, _ = engine._get_session("fl-m")
+        assert session.label_set == {"secret"}
+
+    def test_edit_of_secret_file_labels_the_session(self, client, engine):
+        with _Backends():
+            _call(client, "fl-n", "edit_file", {"path": _SECRET, "edits": []}, 1)
+        session, _ = engine._get_session("fl-n")
+        assert session.label_set == {"secret"}
+
+    def test_untrusted_write_is_refused_and_not_recorded(self, client, engine):
+        with _Backends():
+            _call(client, "fl-o", "fetch", {"url": "https://example.org/"}, 1)
+            body = _call(client, "fl-o", "write_file", {"path": f"{_NOTES}/o.txt", "content": "x"}, 2)
+        assert body["error"]["code"] == -32001
+        assert len(engine.file_labels) == 0
+
+    def test_corrupt_store_fails_startup(self, tmp_path):
+        from src.engine.labels import FileLabelStore
+
+        bad = tmp_path / "file_labels.json"
+        bad.write_text("{not json")
+        with pytest.raises(ValueError):
+            FileLabelStore(str(bad))
+
+    def test_unpersistable_store_fails_closed(self, policy, tmp_path):
+        from src.engine.labels import FileLabelStore
+
+        blocker = tmp_path / "is_a_file"
+        blocker.write_text("x")
+        engine = SessionGraphManager(policy, file_label_store=FileLabelStore(str(blocker / "labels.json")))
+        client = _app(policy, engine)
+        with _Backends(_web_or_fs) as backends:
+            _call(client, "fl-p", "read_text_file", {"path": _SECRET}, 1)
+            body = _call(client, "fl-p", "write_file", {"path": f"{_NOTES}/p.txt", "content": "x"}, 2)
+        assert body["error"]["code"] == -32001
+        assert body["error"]["data"]["check"] == "file_label_store"
+        assert len(backends.calls) == 1

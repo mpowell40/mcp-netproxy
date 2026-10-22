@@ -16,6 +16,7 @@ each label may not reach (e.g. ``untrusted`` -> LOCAL_WRITE).
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -23,12 +24,14 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, NamedTuple
 
 from src.engine.labels import (
+    FileLabelStore,
     LabelOrigin,
     LabelResolver,
     describe_source,
     extract_secret_values,
     find_tracked_fragment,
     fragments_of,
+    path_values,
 )
 from src.models.policy import ForbiddenInvariant, PolicyConfig, SinkRule, ToolState
 
@@ -36,6 +39,8 @@ logger = logging.getLogger("mcp-netproxy")
 
 DEFAULT_SESSION_TTL = 3600.0  # seconds of inactivity before a session is evicted
 DEFAULT_MAX_HISTORY = 1024  # per-session bound on transition / trajectory records
+# Overrides labels.file_labels.store_path (tests, alternate deployments)
+FILE_LABEL_STORE_ENV = "MCP_FILE_LABEL_STORE"
 MAX_LABEL_ORIGINS = 32  # per-session, per-label bound on recorded label origins
 MAX_ALERTS = 32  # per-session bound on recorded scanner alerts
 
@@ -133,9 +138,14 @@ class SessionGraphManager:
         session_ttl: float | None = DEFAULT_SESSION_TTL,
         max_history: int = DEFAULT_MAX_HISTORY,
         clock: Callable[[], float] = time.monotonic,
+        file_label_store: FileLabelStore | None = None,
     ) -> None:
         self._policy = policy
-        self._labels = LabelResolver(policy)
+        if file_label_store is None:
+            file_label_store = FileLabelStore(
+                os.getenv(FILE_LABEL_STORE_ENV) or policy.labels.file_labels.store_path
+            )
+        self._labels = LabelResolver(policy, file_label_store)
         self._sessions: dict[str, SessionState] = {}
         self._lock = threading.Lock()  # Protects _sessions dict creation
         self._session_locks: dict[str, threading.Lock] = {}
@@ -356,6 +366,60 @@ class SessionGraphManager:
         ):
             self._track_values(session_id, response_text)
         return applied
+
+    @property
+    def file_labels(self) -> FileLabelStore:
+        return self._labels.store
+
+    def record_write(
+        self, session_id: str, tool_name: str, arguments: dict[str, Any] | None = None
+    ) -> list[str]:
+        """Propagate labels to the files a LOCAL_WRITE call is about to change.
+
+        Every destination path gets the session's current labels, plus the
+        labels of the call's source paths (``move_file``'s ``source``: glob
+        and stored labels, including those stored under it).  Called after
+        the call has passed every check and *before* it is forwarded, so a
+        write the backend performs but never confirms is still recorded;
+        over-labeling a write that then fails is the safe direction.
+        Raises OSError if the store cannot be persisted (callers fail closed).
+        Returns the destination paths that gained labels.
+        """
+        if self._policy.resolve_state(tool_name, arguments) is not ToolState.LOCAL_WRITE:
+            return []
+        cfg = self._policy.labels.file_labels
+        path_args = self._policy.path_arguments_for(tool_name)
+        sources = path_values(arguments, [a for a in path_args if a in cfg.source_arguments])
+        destinations = path_values(arguments, [a for a in path_args if a not in cfg.source_arguments])
+        if not destinations:
+            return []
+
+        session, slock = self._get_session(session_id)
+        with slock:
+            session_origins = [o for origins in session.labels.values() for o in origins]
+        carried = [o for src in sources for o in self._labels.path_origins(tool_name, src)]
+
+        changed: list[str] = []
+        store = self._labels.store
+        for dest in destinations:
+            entries = [
+                {
+                    "label": o.label,
+                    "source": o.source,
+                    "rule": o.rule,
+                    "written_by": f"{tool_name}:{dest}",
+                    "session": session_id,
+                    "timestamp": time.time(),
+                }
+                for o in session_origins + carried
+            ]
+            touched = store.add(dest, entries) if entries else False
+            for src in sources:
+                touched |= store.copy_tree(src, dest)
+            if touched:
+                changed.append(dest)
+                logger.info(f"[FILE LABELS] '{dest}' labeled by '{tool_name}' in session '{session_id}'")
+        return changed
 
     def _track_values(self, session_id: str, text: str) -> None:
         tracking = self._policy.labels.value_tracking

@@ -111,9 +111,20 @@ tool_mappings:
 #                             argument ("**" spans segments, "*" stays in one;
 #                             no leading "/" = match anywhere in the path)
 #   path_label_states  DFA states whose path arguments carry path labels
+#                      (LOCAL_WRITE included: edit_file returns a diff of the
+#                      file it edits)
 #   sinks              DFA states each label may not reach.  Checked before
 #                      the transition graph; a block returns -32001 with the
 #                      session's labels and their origins.
+#   file_labels        a LOCAL_WRITE by a labeled session (write_file,
+#                      edit_file, create_directory, move_file) stores its
+#                      labels on the canonical destination path; move_file
+#                      also carries the source path's labels.  Later reads of
+#                      the path (or anything under it) get those labels.
+#                      Persisted as JSON at store_path (env override:
+#                      MCP_FILE_LABEL_STORE).  Not covered: writes through
+#                      tools the proxy does not classify as LOCAL_WRITE, and
+#                      files changed outside the proxy.
 #   value_tracking     secondary defense: fragments of secret-looking values
 #                      read from a tracked source are refused in later calls
 #                      into these sinks.  Encoding or paraphrase evades it;
@@ -136,7 +147,11 @@ labels:
         - "**/*.env"
         - "**/credentials*"
 
-  path_label_states: [LOCAL_READ, DISCOVERY]
+  path_label_states: [LOCAL_READ, DISCOVERY, LOCAL_WRITE]
+
+  file_labels:
+    store_path: /app/state/file_labels.json   # proxy-state volume (docker-compose.yml)
+    source_arguments: [source]                # move_file: carry these paths' labels
 
   sinks:
     - label: untrusted

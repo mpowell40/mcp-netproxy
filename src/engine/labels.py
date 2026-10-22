@@ -10,14 +10,23 @@ name and by path glob, and only ever accumulate on a session.
 from __future__ import annotations
 
 import functools
+import json
+import logging
+import os
+import posixpath
 import re
+import threading
 import time
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any
 
-from src.engine.paths import path_forms
+from src.engine.paths import canonical_path, path_forms
 from src.models.policy import PolicyConfig, ToolState
+
+logger = logging.getLogger("mcp-netproxy")
+
+MAX_FILE_LABEL_ORIGINS = 32  # per-path, per-label bound on stored origins
 
 # Argument names that identify what a tool read, in priority order
 _SOURCE_ARGUMENTS = ("path", "url", "uri", "paths", "source", "query")
@@ -49,9 +58,13 @@ class LabelOrigin:
     source: str
     rule: str
     timestamp: float = field(default_factory=time.time)
+    detail: str = ""  # provenance chain for labels inherited through files
 
     def to_dict(self) -> dict[str, Any]:
-        return {"label": self.label, "source": self.source, "rule": self.rule, "timestamp": self.timestamp}
+        out = {"label": self.label, "source": self.source, "rule": self.rule, "timestamp": self.timestamp}
+        if self.detail:
+            out["detail"] = self.detail
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -105,11 +118,137 @@ def path_values(arguments: dict[str, Any] | None, names: list[str]) -> list[str]
     return out
 
 
-class LabelResolver:
-    """Decides which labels a call's response carries, from policy alone."""
+def _store_key(path: str) -> str:
+    """Canonical form a file label is stored under."""
+    raw = path.replace("\\", "/")
+    return canonical_path(raw) or posixpath.normpath(raw)
 
-    def __init__(self, policy: PolicyConfig) -> None:
+
+def _ancestors(path: str):
+    """*path* and each of its parent directories, deepest first."""
+    while True:
+        yield path
+        parent = posixpath.dirname(path)
+        if parent == path or not parent:
+            return
+        path = parent
+
+
+class FileLabelStore:
+    """Persistent path -> labels map for files written by labeled sessions.
+
+    Labels on a path only accumulate.  A path also carries the labels of
+    every stored ancestor directory, so a labeled directory (created or
+    moved by a labeled session) labels everything under it.  The store is
+    a JSON file rewritten atomically on every change; ``path=None`` keeps
+    it in memory only.
+
+    Known limitations: writes made through tools the proxy does not
+    classify as LOCAL_WRITE, and files changed outside the proxy (another
+    process, a shell, the backend's own side effects), are not recorded.
+    """
+
+    VERSION = 1
+
+    def __init__(self, path: str | None = None) -> None:
+        self._path = path
+        self._lock = threading.Lock()
+        self._entries: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        if path and os.path.exists(path):
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)  # a corrupt store fails startup loudly
+            if not isinstance(data, dict) or data.get("version") != self.VERSION:
+                raise ValueError(f"Unrecognized file label store format: {path}")
+            self._entries = data.get("paths", {})
+            logger.info(f"[FILE LABELS] Loaded {len(self._entries)} labeled paths from {path}")
+
+    @property
+    def path(self) -> str | None:
+        return self._path
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+    def snapshot(self) -> dict[str, dict[str, list[dict[str, Any]]]]:
+        with self._lock:
+            return json.loads(json.dumps(self._entries))
+
+    def lookup(self, path: str) -> list[tuple[str, str, dict[str, Any]]]:
+        """``(label, stored_path, entry)`` for *path* and its stored ancestors."""
+        hits: list[tuple[str, str, dict[str, Any]]] = []
+        seen: set[tuple[str, str]] = set()
+        with self._lock:
+            if not self._entries:
+                return hits
+            for form in path_forms(path):
+                for candidate in _ancestors(form):
+                    for label, entries in self._entries.get(candidate, {}).items():
+                        if (label, candidate) not in seen and entries:
+                            seen.add((label, candidate))
+                            hits.append((label, candidate, entries[0]))
+        return hits
+
+    def add(self, path: str, entries: list[dict[str, Any]]) -> bool:
+        """Join *entries* (each with a ``label``) into *path*; persist if changed."""
+        key = _store_key(path)
+        with self._lock:
+            changed = self._merge_locked(key, entries)
+            if changed:
+                self._persist_locked()
+        return changed
+
+    def copy_tree(self, source: str, destination: str) -> bool:
+        """Carry stored labels of everything under *source* to the same place under *destination*."""
+        src, dst = _store_key(source), _store_key(destination)
+        prefix = src.rstrip("/") + "/"
+        with self._lock:
+            moved = {
+                dst + key[len(src):]: labels
+                for key, labels in self._entries.items()
+                if key.startswith(prefix)
+            }
+            changed = False
+            for key, labels in moved.items():
+                for entries in labels.values():
+                    changed |= self._merge_locked(key, entries)
+            if changed:
+                self._persist_locked()
+        return changed
+
+    def _merge_locked(self, key: str, entries: list[dict[str, Any]]) -> bool:
+        changed = False
+        labels = self._entries.setdefault(key, {})
+        for entry in entries:
+            stored = labels.setdefault(entry["label"], [])
+            ident = (entry.get("source"), entry.get("rule"))
+            if any((e.get("source"), e.get("rule")) == ident for e in stored):
+                continue
+            if len(stored) < MAX_FILE_LABEL_ORIGINS:  # the label itself is never dropped
+                stored.append(entry)
+                changed = True
+        return changed
+
+    def _persist_locked(self) -> None:
+        if not self._path:
+            return
+        directory = os.path.dirname(self._path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        tmp = f"{self._path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"version": self.VERSION, "paths": self._entries}, fh, indent=1, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, self._path)
+
+
+class LabelResolver:
+    """Decides which labels a call's response carries, from policy and the file store."""
+
+    def __init__(self, policy: PolicyConfig, store: FileLabelStore | None = None) -> None:
         self._policy = policy
+        self.store = store if store is not None else FileLabelStore(None)
 
     @property
     def enabled(self) -> bool:
@@ -126,13 +265,31 @@ class LabelResolver:
                     break
         return hits
 
+    def path_origins(self, tool_name: str, path: str) -> list[LabelOrigin]:
+        """Labels *path* carries: glob rules plus labels stored by earlier writes."""
+        origins = [
+            LabelOrigin(label, f"{tool_name}:{path}", f"path:{pattern}")
+            for label, pattern in self.path_labels(path)
+        ]
+        for label, stored_path, entry in self.store.lookup(path):
+            origins.append(LabelOrigin(
+                label, f"{tool_name}:{path}", f"file:{stored_path}",
+                detail=(
+                    f"written by {entry.get('written_by', '?')} in session "
+                    f"'{entry.get('session', '?')}'; originally {entry.get('source', '?')} "
+                    f"({entry.get('rule', '?')})"
+                ),
+            ))
+        return origins
+
     def source_labels(
         self, tool_name: str, state: ToolState, arguments: dict[str, Any] | None
     ) -> list[LabelOrigin]:
         """Labels the response to this call carries.
 
         Tool labels apply to every response of the tool.  Path labels apply
-        to calls in ``path_label_states`` whose path arguments match a glob.
+        to calls in ``path_label_states`` whose path arguments match a glob
+        or were written by a labeled session (the file label store).
         """
         labels_cfg = self._policy.labels
         origins: list[LabelOrigin] = []
@@ -142,8 +299,7 @@ class LabelResolver:
                 origins.append(LabelOrigin(label, described, f"tool:{tool_name}"))
         if state in labels_cfg.path_label_states:
             for path in path_values(arguments, self._policy.path_arguments_for(tool_name)):
-                for label, pattern in self.path_labels(path):
-                    origins.append(LabelOrigin(label, f"{tool_name}:{path}", f"path:{pattern}"))
+                origins.extend(self.path_origins(tool_name, path))
         return origins
 
 
