@@ -114,6 +114,10 @@ tool_mappings:
 #   sinks              DFA states each label may not reach.  Checked before
 #                      the transition graph; a block returns -32001 with the
 #                      session's labels and their origins.
+#   value_tracking     secondary defense: fragments of secret-looking values
+#                      read from a tracked source are refused in later calls
+#                      into these sinks.  Encoding or paraphrase evades it;
+#                      the labels are the guarantee.
 labels:
   sources:
     untrusted:
@@ -147,6 +151,14 @@ labels:
       reason: >-
         Session holds secret-origin data; it cannot reach network egress or
         command execution (exfiltration).
+
+  value_tracking:
+    enabled: true
+    labels: [secret]
+    sinks: [NETWORK_EGRESS, EXECUTE]
+    fragment_length: 7          # same window as the eval's canary fragment check
+    min_value_length: 8
+    max_fragments_per_session: 4096
 
 # ----------------------------------------------------------------------------
 # Layer 1 argument limits (rejected before forwarding)

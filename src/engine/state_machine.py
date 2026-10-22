@@ -22,7 +22,14 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, NamedTuple
 
-from src.engine.labels import LabelOrigin, LabelResolver, describe_source
+from src.engine.labels import (
+    LabelOrigin,
+    LabelResolver,
+    describe_source,
+    extract_secret_values,
+    find_tracked_fragment,
+    fragments_of,
+)
 from src.models.policy import ForbiddenInvariant, PolicyConfig, SinkRule, ToolState
 
 logger = logging.getLogger("mcp-netproxy")
@@ -43,7 +50,7 @@ class TransitionRecord:
     tool_name: str
     from_state: ToolState
     to_state: ToolState
-    status: str  # "ALLOWED" | "BLOCKED_LABEL" | "BLOCKED_TRANSITION" | "BLOCKED_INVARIANT" | "BLOCKED_UNKNOWN"
+    status: str  # "ALLOWED" | "BLOCKED_LABEL" | "BLOCKED_VALUE" | "BLOCKED_TRANSITION" | "BLOCKED_INVARIANT" | "BLOCKED_UNKNOWN"
     reason: str = ""
 
 
@@ -74,6 +81,9 @@ class SessionState:
     # the label set is the key set, so the origin bound never clears a label.
     labels: dict[str, list[LabelOrigin]] = field(default_factory=dict)
     label_origins_dropped: int = 0
+    # Value tracking: fragments of secret values this session has read.
+    tracked_fragments: set[str] = field(default_factory=set)
+    tracked_fragments_dropped: int = 0
     # Ingest scanner alerts: telemetry only, never an input to enforcement.
     alerts: list[dict[str, Any]] = field(default_factory=list)
     alerts_dropped: int = 0
@@ -232,6 +242,7 @@ class SessionGraphManager:
                     session, tool_name, from_state, to_state, "BLOCKED_UNKNOWN", reason
                 )
                 meta["status"] = record.status
+                meta["check"] = "unknown_tool"
                 return False, reason, meta
 
             # 2. Label sink policy (sticky provenance labels):
@@ -250,6 +261,27 @@ class SessionGraphManager:
                 meta["labels"] = session.labels_dict()
                 return False, reason, meta
 
+            # 2b. Value tracking (secondary defense; see labels.py for what
+            # evades it).  Outbound arguments carrying a fragment of a value
+            # read from a value-tracked source are refused.
+            tracking = self._policy.labels.value_tracking
+            if (
+                tracking.enabled
+                and to_state in tracking.sinks
+                and find_tracked_fragment(arguments, session.tracked_fragments, tracking.fragment_length)
+            ):
+                reason = (
+                    "Arguments contain a value read from a "
+                    f"{'/'.join(tracking.labels)}-labeled source (value tracking)."
+                )
+                record = self._record(
+                    session, tool_name, from_state, to_state, "BLOCKED_VALUE", reason
+                )
+                meta["status"] = record.status
+                meta["check"] = "value_tracking"
+                meta["labels"] = session.labels_dict()
+                return False, reason, meta
+
             # 3. Check forbidden invariants (takes priority over allowed)
             violated: ForbiddenInvariant | None = self._policy.check_invariants(
                 from_state, to_state, session.visited_states
@@ -260,6 +292,7 @@ class SessionGraphManager:
                     session, tool_name, from_state, to_state, "BLOCKED_INVARIANT", reason
                 )
                 meta["status"] = record.status
+                meta["check"] = "forbidden_invariant"
                 meta["invariant_rule"] = {
                     "from": violated.from_state.value,
                     "to": violated.to_state.value,
@@ -276,6 +309,7 @@ class SessionGraphManager:
                     session, tool_name, from_state, to_state, "BLOCKED_TRANSITION", reason
                 )
                 meta["status"] = record.status
+                meta["check"] = "transition_graph"
                 return False, reason, meta
 
             # 5. Valid: advance state.  Labels are applied by record_source()
@@ -295,19 +329,47 @@ class SessionGraphManager:
         ]
 
     def record_source(
-        self, session_id: str, tool_name: str, arguments: dict[str, Any] | None = None
+        self,
+        session_id: str,
+        tool_name: str,
+        arguments: dict[str, Any] | None = None,
+        response_text: str = "",
     ) -> list[LabelOrigin]:
         """Apply the labels of the source this call read from.
 
         Called once the backend has answered (successfully or not): labels
         are decided by the policy's source rules for this tool and its path
-        arguments, never by the response content.  Returns the origins that
-        were new to the session.
+        arguments, never by the response content.  If the source carries a
+        value-tracked label, fragments of *response_text*'s secret-looking
+        values are remembered for the outbound check.  Returns the origins
+        that were new to the session.
         """
         origins = self._labels.source_labels(
             tool_name, self._policy.resolve_state(tool_name, arguments), arguments
         )
-        return self.apply_labels(session_id, origins)
+        applied = self.apply_labels(session_id, origins)
+        tracking = self._policy.labels.value_tracking
+        if (
+            tracking.enabled
+            and response_text
+            and any(o.label in tracking.labels for o in origins)
+        ):
+            self._track_values(session_id, response_text)
+        return applied
+
+    def _track_values(self, session_id: str, text: str) -> None:
+        tracking = self._policy.labels.value_tracking
+        new: set[str] = set()
+        for value in extract_secret_values(text, tracking.min_value_length):
+            new |= fragments_of(value, tracking.fragment_length)
+        session, slock = self._get_session(session_id)
+        with slock:
+            new -= session.tracked_fragments
+            room = tracking.max_fragments_per_session - len(session.tracked_fragments)
+            if len(new) > room:
+                session.tracked_fragments_dropped += len(new) - max(room, 0)
+                new = set(sorted(new)[:max(room, 0)])
+            session.tracked_fragments |= new
 
     def apply_labels(self, session_id: str, origins: list[LabelOrigin]) -> list[LabelOrigin]:
         """Join *origins* into the session's labels; return those not seen before."""
@@ -353,6 +415,9 @@ class SessionGraphManager:
                 "is_tainted": session.is_tainted,
                 "labels": session.labels_dict(),
                 "label_origins_dropped": session.label_origins_dropped,
+                # Fragments themselves are secret; only their count is exposed
+                "tracked_fragments": len(session.tracked_fragments),
+                "tracked_fragments_dropped": session.tracked_fragments_dropped,
                 "alerts": list(session.alerts),
                 "alerts_dropped": session.alerts_dropped,
                 "state_history": [

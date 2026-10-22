@@ -12,6 +12,7 @@ from __future__ import annotations
 import functools
 import re
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -144,3 +145,95 @@ class LabelResolver:
                 for label, pattern in self.path_labels(path):
                     origins.append(LabelOrigin(label, f"{tool_name}:{path}", f"path:{pattern}"))
         return origins
+
+
+# ---------------------------------------------------------------------------
+# Value tracking (secondary defense)
+# ---------------------------------------------------------------------------
+#
+# When a response comes from a source whose labels are value-tracked
+# (``secret`` by default), fixed-length fragments of its secret-looking
+# values are remembered per session, and a later call into a tracked sink
+# whose arguments contain any fragment is refused.
+#
+# This is a best-effort backstop, NOT the guarantee.  It is evaded by any
+# transformation of the value before it leaves: base64/hex or other
+# encodings, reversal, case changes, interleaving characters, splitting
+# into pieces shorter than the fragment length, paraphrase or summary, and
+# values the extractor below does not recognize as secret-looking.  The
+# sticky ``secret`` label and its sink rule are what actually stop
+# exfiltration; value tracking only matters where a sink rule is relaxed.
+
+# KEY=VALUE / KEY: VALUE / export KEY=VALUE (dotenv, ini, yaml)
+_ASSIGNMENT = re.compile(r"""^\s*(?:export\s+)?["']?[A-Za-z_][\w.-]*["']?\s*[=:]\s*(.+?)\s*,?\s*$""")
+# Credential-shaped tokens: long runs of token characters
+_TOKEN = re.compile(r"[A-Za-z0-9+/=_\-.~]+")
+_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+
+
+def _looks_secret(token: str) -> bool:
+    """A token mixing letters with digits or symbols (keys, passwords, IDs)."""
+    has_alpha = any(c.isalpha() for c in token)
+    has_other = any(c.isdigit() or not c.isalnum() for c in token)
+    return has_alpha and has_other
+
+
+def extract_secret_values(text: str, min_length: int) -> set[str]:
+    """Secret-looking values in *text*.
+
+    Every assigned value (``KEY=VALUE``) of at least *min_length*
+    characters, plus every credential-shaped token of that length.
+    Comment lines are skipped; a leading URL scheme is dropped so that
+    ``https://`` is never remembered as part of a secret.
+    """
+    values: set[str] = set()
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", "//", ";")):
+            continue
+        match = _ASSIGNMENT.match(line)
+        if match:
+            value = _SCHEME.sub("", match.group(1).strip().strip("\"'"))
+            if len(value) >= min_length:
+                values.add(value)
+        for token in _TOKEN.findall(stripped):
+            token = _SCHEME.sub("", token)
+            if len(token) >= min_length and _looks_secret(token):
+                values.add(token)
+    return values
+
+
+def fragments_of(value: str, length: int) -> set[str]:
+    """Every window of *length* characters in *value* (or the value itself if shorter)."""
+    if len(value) <= length:
+        return {value}
+    return {value[i:i + length] for i in range(len(value) - length + 1)}
+
+
+def _argument_strings(value: Any):
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from _argument_strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _argument_strings(item)
+    elif value is not None:
+        text = str(value)
+        yield text
+        decoded = urllib.parse.unquote_plus(text)
+        if decoded != text:
+            yield decoded
+
+
+def find_tracked_fragment(arguments: Any, fragments: set[str], length: int) -> bool:
+    """Whether any argument value (raw or URL-decoded) contains a tracked fragment."""
+    if not fragments:
+        return False
+    for text in _argument_strings(arguments):
+        if len(text) < length:
+            if text in fragments:
+                return True
+            continue
+        if not fragments.isdisjoint(text[i:i + length] for i in range(len(text) - length + 1)):
+            return True
+    return False

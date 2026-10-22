@@ -340,7 +340,9 @@ def create_app(
         # results) reached the agent, so the source's labels apply.  Only a
         # proxy-generated connection failure carries no backend data.
         if not isinstance(response, _ForwardFailure):
-            applied = _engine.record_source(session_id, resolved.canonical, arguments)
+            applied = _engine.record_source(
+                session_id, resolved.canonical, arguments, _response_text(response.body)
+            )
             if applied:
                 after["labels_applied"] = [o.to_dict() for o in applied]
                 logger.info(
@@ -471,6 +473,28 @@ async def _backend_client(shared: httpx.AsyncClient | None):
     else:
         async with httpx.AsyncClient() as client:
             yield client
+
+
+def _response_text(body: bytes) -> str:
+    """All text a backend response hands the agent (result content and error text)."""
+    try:
+        parsed = json.loads(body)
+    except (ValueError, TypeError):
+        return body.decode("utf-8", "replace") if isinstance(body, bytes) else ""
+    if not isinstance(parsed, dict):
+        return ""
+    parts: list[str] = []
+    result = parsed.get("result")
+    if isinstance(result, dict):
+        for block in result.get("content", []) or []:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                parts.append(block["text"])
+    error = parsed.get("error")
+    if isinstance(error, dict):
+        parts.append(str(error.get("message", "")))
+        if "data" in error:
+            parts.append(json.dumps(error["data"]))
+    return "\n".join(parts)
 
 
 class _ForwardFailure(Response):
