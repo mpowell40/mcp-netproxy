@@ -61,6 +61,16 @@ Autonomous AI agents interact with local and remote environments by invoking str
 - Tracks session state trajectories using thread-safe, in-memory session managers keyed by `X-Session-ID` (with fallback to client IP).
 - Maps tool calls to formal states: `START`, `DISCOVERY`, `LOCAL_READ`, `LOCAL_WRITE`, `UNTRUSTED_INGEST`, `EXECUTE`, and `NETWORK_EGRESS`.
 - Enforces strict transition invariants declared in `config/policy.yaml`. Transitions such as `UNTRUSTED_INGEST -> LOCAL_WRITE` are blocked with JSON-RPC error code `-32001 (Security Invariant Violation)`: `[SECURITY BLOCKED - DFA INVARIANT]`.
+- Before the transition graph, checks the session's provenance labels against the policy's label sink rules (see below).
+
+### 2a. Provenance Labels (Phase 5 information flow control)
+- A session is labeled by **where** its data came from, never by what the data says. `untrusted` (integrity) comes from every `web__fetch` response and from `sandbox/**/inbox/**`; `secret` (confidentiality) comes from `**/secrets/**`, `**/*.env` and `**/credentials*`. Globs match the canonical realpath.
+- Labels are sticky: they only accumulate until session reset or TTL expiry. `/session/<id>` lists each label with its origins (tool, path or URL, and the rule that matched).
+- Declarative sink rules in `labels.sinks` block `untrusted` sessions from `LOCAL_WRITE`, `EXECUTE` and `NETWORK_EGRESS`, and `secret` sessions from `NETWORK_EGRESS` and `EXECUTE`. Blocks return `-32001` with the labels and origins in `error.data`.
+- Files written or moved by a labeled session keep its labels in a persistent store (`/app/state/file_labels.json`), so a later session reading them is labeled too.
+- Value tracking refuses outbound arguments that carry fragments of secret values. It is a secondary defense that encoding evades; the labels are the guarantee.
+- The regex ingest scanner remains, but only records alerts in telemetry.
+- Expected cost: fetch-then-write and fetch-then-fetch workflows are refused. Results are in `eval/runs/phase5-dev/` and `eval/runs/phase5-live/`.
 
 ### 3. Dynamic Tool Discovery & Classification
 - Intercepts `tools/list` payloads dynamically during client initialization.
@@ -75,25 +85,28 @@ Autonomous AI agents interact with local and remote environments by invoking str
 mcp-proxy-testbed/
 ├── src/                            # mcp-netproxy: the policy enforcement proxy
 │   ├── main.py                     #   FastAPI entry point and inspection pipeline
-│   ├── engine/                     #   registry, classifier, DFA, ingest scanner, egress guard, argument checks
+│   ├── engine/                     #   registry, classifier, DFA, provenance labels, ingest scanner (alerts), egress guard, argument checks
 │   └── models/policy.py            #   Pydantic policy schema (states, backends, invariants)
 ├── config/
-│   ├── policy.yaml                 # Policy used for the reported evaluation (frozen at 8c566d3)
-│   └── policy.live.yaml            # Same policy plus a live-internet egress allowlist
+│   ├── policy.yaml                 # Phase 5 provenance-label policy (Phase 4 policy: git tag phase4-frozen)
+│   ├── policy.phase5.live.yaml     # Phase 5 policy plus a live-internet egress allowlist
+│   └── policy.live.yaml            # Phase 4 policy plus the live-internet allowlist (kept for eval/runs/live)
 ├── backends/                       # MCP servers behind the proxy (HTTP wrappers over stdio)
 │   ├── filesystem/                 #   @modelcontextprotocol/server-filesystem  (mcp-unprotected, :9000)
 │   └── fetch/                      #   mcp-server-fetch                         (mcp-fetch-backend, :9001)
 │       └── fixtures/               #   HTML pages it serves at /fixtures/<name>
 ├── compose/                        # Docker Compose overlays for docker-compose.yml
 │   ├── eval.yml                    #   adds the eval-only redirect service
-│   └── live.yml                    #   switches the proxy to config/policy.live.yaml
+│   ├── live.yml                    #   switches the proxy to config/policy.live.yaml (Phase 4)
+│   └── phase5-live.yml             #   switches the proxy to config/policy.phase5.live.yaml
 ├── eval/                           # Scenario-based evaluation (see eval/README.md)
 │   ├── run_eval.py                 #   harness: replays scenarios through the proxy and scores them
 │   ├── gen_scenarios.py            #   source of the frozen scenario set   -> scenarios/
 │   ├── gen_live_scenarios.py       #   source of the live-internet set     -> scenarios_live/
 │   ├── canary/                     #   out-of-sandbox canary file (boundary target)
 │   ├── services/                   #   eval-only services (redirect server)
-│   └── runs/                       #   results: baseline/, final/, live/, tuning/
+│   ├── scenarios_phase5_holdout/   #   reserved for the Phase 5 blind holdout set (see its README)
+│   └── runs/                       #   results: baseline/, final/, live/ (Phase 4); phase5-dev/, phase5-live/; tuning/
 ├── sandbox/                        # The only directory agents may touch (filesystem backend scope)
 │   ├── eval/                       #   fixtures used by eval scenarios
 │   └── phase-3-test/               #   fixtures for the Claude Desktop demos below
