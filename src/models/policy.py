@@ -1,7 +1,8 @@
 """Declarative Policy Schema for Behavioral State-Machine Invariant Enforcement.
 
 Defines the DFA state space, tool-to-state mappings, legal transitions,
-and forbidden invariants loaded from a YAML configuration file.
+forbidden invariants and provenance labels loaded from a YAML configuration
+file.
 """
 
 from __future__ import annotations
@@ -9,7 +10,7 @@ from __future__ import annotations
 import enum
 import pathlib
 import re
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field, PrivateAttr, model_validator
@@ -82,6 +83,107 @@ class EgressConfig(BaseModel):
     private_hosts: list[str] = Field(default_factory=list)
 
 
+class LabelSource(BaseModel):
+    """Where one provenance label comes from.
+
+    Labels are assigned by *where* data came from, never by what it says.
+
+    Attributes:
+        axis: ``integrity`` (e.g. ``untrusted``) or ``confidentiality``
+            (e.g. ``secret``).  Documentation only; every label is enforced
+            the same way, through ``sinks``.
+        tools: Canonical tool names (``web__fetch``, ``browser_action``)
+            whose every response carries the label, regardless of content.
+        paths: Globs matched against the canonical realpath of each path
+            argument.  ``**`` spans any number of segments, ``*`` and ``?``
+            stay within one.  A glob without a leading ``/`` matches any
+            suffix of the path (``sandbox/**/inbox/**``).
+    """
+
+    axis: Literal["integrity", "confidentiality"]
+    tools: list[str] = Field(default_factory=list)
+    paths: list[str] = Field(default_factory=list)
+
+
+class SinkRule(BaseModel):
+    """Calls a labeled session may not make.
+
+    A session carrying ``label`` is refused any call whose target DFA state
+    is in ``block``.  Checked before the transition graph.
+    """
+
+    label: str
+    block: list[ToolState]
+    reason: str
+
+
+class ValueTrackingConfig(BaseModel):
+    """Secondary defense: remember values read from labeled sources.
+
+    Fragments of secret-looking values in responses from a source carrying
+    one of ``labels`` are stored per session; a later call into one of
+    ``sinks`` whose arguments contain a fragment is refused.  Encoding or
+    paraphrase evades this; the labels are the guarantee.
+    """
+
+    enabled: bool = True
+    labels: list[str] = Field(default_factory=lambda: ["secret"])
+    sinks: list[ToolState] = Field(
+        default_factory=lambda: [ToolState.NETWORK_EGRESS, ToolState.EXECUTE]
+    )
+    fragment_length: int = Field(default=7, ge=4)
+    min_value_length: int = Field(default=8, ge=4)
+    max_fragments_per_session: int = Field(default=4096, ge=1)
+
+
+class FileLabelConfig(BaseModel):
+    """Label propagation from sessions to the files they write.
+
+    Attributes:
+        store_path: JSON file holding path -> labels.  Persisted across
+            proxy restarts; ``None`` keeps the store in memory only.
+        source_arguments: Path arguments of a LOCAL_WRITE call that name
+            where data comes *from* (``move_file``'s ``source``).  Their
+            labels are carried to the destination.  Every other path
+            argument of a LOCAL_WRITE call is a destination.
+    """
+
+    store_path: str | None = None
+    source_arguments: list[str] = Field(default_factory=lambda: ["source"])
+
+
+class LabelPolicy(BaseModel):
+    """Provenance-based information flow control.
+
+    Attributes:
+        sources: Label name -> where it comes from.
+        path_label_states: DFA states whose calls carry the labels of the
+            paths they name (reads and listings return data about them).
+        sinks: Which DFA states each label may not reach.
+        value_tracking: Secondary value-fragment check on outbound calls.
+        file_labels: Persistent labels on files written by labeled sessions.
+    """
+
+    sources: dict[str, LabelSource] = Field(default_factory=dict)
+    path_label_states: list[ToolState] = Field(
+        default_factory=lambda: [ToolState.LOCAL_READ, ToolState.DISCOVERY]
+    )
+    sinks: list[SinkRule] = Field(default_factory=list)
+    value_tracking: ValueTrackingConfig = Field(default_factory=ValueTrackingConfig)
+    file_labels: FileLabelConfig = Field(default_factory=FileLabelConfig)
+
+    @model_validator(mode="after")
+    def _known_labels(self) -> "LabelPolicy":
+        known = set(self.sources)
+        for rule in self.sinks:
+            if rule.label not in known:
+                raise ValueError(f"Sink rule references undeclared label '{rule.label}'")
+        for label in self.value_tracking.labels:
+            if label not in known and self.sources:
+                raise ValueError(f"value_tracking references undeclared label '{label}'")
+        return self
+
+
 class BackendConfig(BaseModel):
     """A downstream MCP server registered behind the proxy.
 
@@ -127,6 +229,8 @@ class PolicyConfig(BaseModel):
         backends: Registered downstream MCP servers, keyed by namespace.
         default_backend: Namespace that receives non-``tools/call`` traffic
             and tools that no registered backend serves.
+        labels: Provenance labels and the sinks they may not reach.  Empty
+            (the default) disables label enforcement.
     """
 
     tool_mappings: dict[str, ToolState]
@@ -135,6 +239,7 @@ class PolicyConfig(BaseModel):
     backends: dict[str, BackendConfig] = Field(default_factory=dict)
     default_backend: str | None = None
     argument_limits: ArgumentLimits = Field(default_factory=ArgumentLimits)
+    labels: LabelPolicy = Field(default_factory=LabelPolicy)
 
     # Names declared at the top level of ``tool_mappings``; never replaced
     # or withdrawn by backend aliasing.
@@ -222,6 +327,17 @@ class PolicyConfig(BaseModel):
         with path.open("r", encoding="utf-8") as fh:
             raw = yaml.safe_load(fh)
         return cls.model_validate(raw)
+
+    def path_arguments_for(self, tool_name: str) -> list[str]:
+        """Path-like argument names of the backend that serves *tool_name*."""
+        split = self.split_namespaced(tool_name)
+        if split is not None:
+            return self.backends[split[0]].path_arguments
+        owners = self.backends_serving(tool_name)
+        namespace = owners[0] if len(owners) == 1 else self.default_backend
+        if namespace is not None and namespace in self.backends:
+            return self.backends[namespace].path_arguments
+        return ["path"]
 
     def resolve_state(
         self, tool_name: str, arguments: dict[str, Any] | None = None

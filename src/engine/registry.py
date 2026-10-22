@@ -11,13 +11,13 @@ from __future__ import annotations
 import functools
 import logging
 import os
-import posixpath
 from dataclasses import dataclass
 from typing import Any
 
 from src.engine.arguments import find_argument_violation
 from src.engine.classifier import classify_tool
 from src.engine.egress import EgressPolicy
+from src.engine.paths import canonical_path as _canonical
 from src.models.policy import BackendConfig, PolicyConfig, ToolState, namespaced
 
 logger = logging.getLogger("mcp-netproxy")
@@ -199,23 +199,6 @@ class BackendRegistry:
         if resolved.namespace is None:
             return False
         return self.backend(resolved.namespace).scan_responses and state in _SCANNED_STATES
-
-
-def _canonical(path: str) -> str | None:
-    """Resolve dot segments and symlinks the way the backend will.
-
-    Requires the proxy to see the backend's filesystem at the same paths
-    (a read-only mount); components that do not exist yet are kept as-is.
-    Returns None for paths that cannot be resolved unambiguously (relative
-    paths depend on the backend's working directory).
-    """
-    path = path.replace("\\", "/")
-    if not posixpath.isabs(path):
-        return None
-    try:
-        return posixpath.realpath(path)
-    except (OSError, ValueError):
-        return None
 
 
 def _within_roots(path: str, roots: list[str]) -> bool:

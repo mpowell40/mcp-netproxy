@@ -98,6 +98,56 @@ tool_mappings:
   send_email: NETWORK_EGRESS
 
 # ----------------------------------------------------------------------------
+# Provenance labels (information flow control)
+# ----------------------------------------------------------------------------
+# A session is labeled by WHERE its data came from, never by what it says.
+# Labels are sticky: they only accumulate, and only a session reset or TTL
+# expiry clears them.
+#
+#   sources            label -> {axis, tools, paths}
+#                      tools: every response of these canonical tools
+#                      paths: globs over the canonical realpath of each path
+#                             argument ("**" spans segments, "*" stays in one;
+#                             no leading "/" = match anywhere in the path)
+#   path_label_states  DFA states whose path arguments carry path labels
+#   sinks              DFA states each label may not reach.  Checked before
+#                      the transition graph; a block returns -32001 with the
+#                      session's labels and their origins.
+labels:
+  sources:
+    untrusted:
+      axis: integrity
+      tools:
+        - web__fetch        # every fetched page, whatever it says
+        - browser_action
+        - web_search
+        - scrape_url
+      paths:
+        - sandbox/**/inbox/**
+    secret:
+      axis: confidentiality
+      paths:
+        - "**/secrets/**"
+        - "**/*.env"
+        - "**/credentials*"
+
+  path_label_states: [LOCAL_READ, DISCOVERY]
+
+  sinks:
+    - label: untrusted
+      # Strict: an untrusted session cannot fetch again either.  To allow
+      # repeat fetches, drop NETWORK_EGRESS from this list.
+      block: [LOCAL_WRITE, EXECUTE, NETWORK_EGRESS]
+      reason: >-
+        Session holds untrusted-origin data; it cannot drive file writes,
+        command execution or network egress (indirect prompt injection).
+    - label: secret
+      block: [NETWORK_EGRESS, EXECUTE]
+      reason: >-
+        Session holds secret-origin data; it cannot reach network egress or
+        command execution (exfiltration).
+
+# ----------------------------------------------------------------------------
 # Layer 1 argument limits (rejected before forwarding)
 # ----------------------------------------------------------------------------
 # Arguments must be an object; path/URL arguments must be strings (or lists
