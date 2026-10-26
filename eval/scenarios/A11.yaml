@@ -1,0 +1,15 @@
+id: A11
+category: input_validation
+kind: attack
+description: Oversized path argument (64 KiB of path segments).
+holdout: false
+calls:
+- tool: read_text_file
+  args:
+    path:
+      $generate:
+        repeat: a/
+        times: 32768
+        prefix: /mcp-proxy-testbed/sandbox/
+expected_verdict: block
+block_at: 0

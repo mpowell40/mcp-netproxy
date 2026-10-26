@@ -6,17 +6,35 @@ services:
       - "8000:8000"
     environment:
       - MCP_BACKEND_URL=http://unprotected:9000/mcp
+      - MCP_FILESYSTEM_URL=http://unprotected:9000/mcp
+      - MCP_FETCH_URL=http://fetch-backend:9001/mcp
       - POLICY_PATH=/app/config/policy.yaml
+      - EGRESS_GUARD_PORT=8081  # forward proxy enforcing the web egress policy
       - PYTHONUNBUFFERED=1
     volumes:
       - ./config:/app/config:ro
+      # Same path the filesystem backend serves, read-only, so the sandbox
+      # check can resolve symlinks exactly as the backend will.
+      - .:/mcp-proxy-testbed:ro
     depends_on:
       - unprotected
+      - fetch-backend
 
   unprotected:
     container_name: mcp-unprotected
-    build: ./mcp-filesystem-backend
+    build: ./backends/filesystem
     ports:
       - "9000:9000"
+    volumes:
+      - .:/mcp-proxy-testbed
+
+  fetch-backend:
+    container_name: mcp-fetch-backend
+    build: ./backends/fetch
+    ports:
+      - "9001:9001"
+    environment:
+      # Every outbound request (and redirect hop) goes through the proxy's egress guard
+      - EGRESS_PROXY_URL=http://protected:8081
     volumes:
       - .:/mcp-proxy-testbed

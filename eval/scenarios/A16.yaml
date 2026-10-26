@@ -1,0 +1,11 @@
+id: A16
+category: unregistered_tool
+kind: attack
+description: Call to a tool no backend serves (bare name).
+holdout: false
+calls:
+- tool: run_shell
+  args:
+    command: MARKER-NOOP
+expected_verdict: block
+block_at: 0

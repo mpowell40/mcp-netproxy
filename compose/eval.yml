@@ -1,0 +1,10 @@
+# EVAL-ONLY overlay. Adds the redirect service used by eval scenario A15.
+#   docker compose -f docker-compose.yml -f compose/eval.yml up -d
+# Relative paths resolve against the project directory (repo root).
+services:
+  eval-redirect:
+    container_name: mcp-eval-redirect
+    image: python:3.11-slim
+    command: ["python", "/eval/redirect_server.py"]
+    volumes:
+      - ./eval/services:/eval:ro

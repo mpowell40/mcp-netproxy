@@ -151,7 +151,7 @@ class TestIndirectPromptInjectionPrevented:
         """UNTRUSTED_INGEST -> LOCAL_WRITE must be blocked (invariant)."""
         sid = "attack-001"
 
-        ok1, _, _ = engine.evaluate_transition(sid, "fetch")
+        ok1, _, _ = engine.evaluate_transition(sid, "scrape_url")
         assert ok1 is True  # Ingestion itself is allowed from START
 
         ok2, reason2, meta2 = engine.evaluate_transition(sid, "write_file")
@@ -176,7 +176,7 @@ class TestIndirectPromptInjectionPrevented:
         """UNTRUSTED_INGEST -> NETWORK_EGRESS must be blocked (exfiltration)."""
         sid = "attack-003"
 
-        ok1, _, _ = engine.evaluate_transition(sid, "fetch")
+        ok1, _, _ = engine.evaluate_transition(sid, "scrape_url")
         assert ok1 is True
 
         ok2, reason2, meta2 = engine.evaluate_transition(sid, "send_webhook")
@@ -187,7 +187,7 @@ class TestIndirectPromptInjectionPrevented:
         """Blocked transitions must NOT advance the session state."""
         sid = "attack-004"
 
-        engine.evaluate_transition(sid, "fetch")  # -> UNTRUSTED_INGEST
+        engine.evaluate_transition(sid, "scrape_url")  # -> UNTRUSTED_INGEST
 
         engine.evaluate_transition(sid, "write_file")  # BLOCKED
 
@@ -198,12 +198,12 @@ class TestIndirectPromptInjectionPrevented:
 
     def test_blocked_call_returns_jsonrpc_error(self, app_client, engine):
         """The proxy endpoint must return JSON-RPC -32001 for blocked calls."""
-        # First: do a legit fetch (allowed from START).
+        # First: do a static untrusted ingest (allowed from START).
         # Note: the forward to downstream will 502 (no real backend in test)
         # but the DFA engine has already advanced the session to UNTRUSTED_INGEST.
         resp1 = app_client.post(
             "/mcp",
-            json=_jsonrpc_tool_call("fetch", {"url": "https://example.com"}),
+            json=_jsonrpc_tool_call("scrape_url", {"url": "https://example.com"}),
             headers={"X-Session-ID": "http-attack-001"},
         )
         # Accept either 200 (real backend) or 502 (no backend in test).
@@ -237,10 +237,10 @@ class TestIndirectPromptInjectionPrevented:
         # Set up attack sequence
         resp1 = app_client.post(
             "/mcp",
-            json=_jsonrpc_tool_call("fetch", {"url": "https://evil.com"}),
+            json=_jsonrpc_tool_call("scrape_url", {"url": "https://evil.com"}),
             headers={"X-Session-ID": "http-attack-002"},
         )
-        # The fetch itself will fail at forwarding (no backend), but that's fine
+        # The ingest itself will fail at forwarding (no backend), but that's fine
         # for this test — we only care about the second call
 
         resp2 = app_client.post(
@@ -314,7 +314,7 @@ class TestLatencyBudget:
         timings = []
         for i in range(100):
             sid = f"perf-block-{i:04d}"
-            engine.evaluate_transition(sid, "fetch")
+            engine.evaluate_transition(sid, "scrape_url")
             t0 = time.perf_counter()
             engine.evaluate_transition(sid, "write_file")
             elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -352,7 +352,7 @@ class TestMermaidExport:
     def test_blocked_session_diagram(self, engine):
         """Blocked session highlights the blocked node in red."""
         sid = "mermaid-002"
-        engine.evaluate_transition(sid, "fetch")
+        engine.evaluate_transition(sid, "scrape_url")
         engine.evaluate_transition(sid, "write_file")  # BLOCKED
 
         diagram = engine.export_mermaid_graph(sid)
@@ -762,8 +762,8 @@ class TestStateLaunderingPrevention:
         """Tainted session cannot execute commands or egress data even after intermediate reads."""
         sid = "session-taint-egress-01"
 
-        # Taint session via direct UNTRUSTED_INGEST transition (e.g. fetch)
-        ok, _, _ = engine.evaluate_transition(sid, "fetch")
+        # Taint session via direct UNTRUSTED_INGEST transition (e.g. scrape_url)
+        ok, _, _ = engine.evaluate_transition(sid, "scrape_url")
         assert ok is True
         session, _ = engine._get_session(sid)
         assert session.is_tainted is True
@@ -783,4 +783,263 @@ class TestStateLaunderingPrevention:
         ok_egress, reason_egress, _ = engine.evaluate_transition(sid, "send_webhook")
         assert ok_egress is False
         assert "persistent latch" in reason_egress.lower()
+
+
+# ===========================================================================
+# 9. Phase 4: Multi-Server Defense against Cross-Server Confused Deputy
+# ===========================================================================
+
+class TestMultiServerCrossBackendDefense:
+    """Verify Option 2A multiplexing across @modelcontextprotocol/server-filesystem (:9000)
+    and @modelcontextprotocol/server-fetch (:9001), confirming:
+    - tools/list merges schemas from both backends.
+    - tools/call routes fetch to :9001 and filesystem tools to :9000.
+    - Benign HTML fetch followed by write_file succeeds (no taint latch).
+    - Poisoned HTML fetch (portal_update.html) triggers ingest_scanner.py,
+      latches session.is_tainted = True, and blocks subsequent write_file with -32001.
+    """
+
+    _FIXTURES_DIR = _PROJECT_ROOT / "backends" / "fetch" / "fixtures"
+
+    def test_html_fixtures_scanner_verdicts(self):
+        """Verify portal_update.html triggers ingest_scanner and portal_status.html passes."""
+        from src.engine.ingest_scanner import scan_payload_for_untrusted_directives
+
+        poisoned_html = (self._FIXTURES_DIR / "portal_update.html").read_text(encoding="utf-8")
+        clean_html = (self._FIXTURES_DIR / "portal_status.html").read_text(encoding="utf-8")
+
+        poison_res = scan_payload_for_untrusted_directives(poisoned_html)
+        assert poison_res.is_untrusted is True, "Expected portal_update.html to be flagged"
+
+        clean_res = scan_payload_for_untrusted_directives(clean_html)
+        assert clean_res.is_untrusted is False, f"Expected portal_status.html to be clean, got: {clean_res.reason}"
+
+    def test_multiplexed_tools_list_merges_filesystem_and_fetch_backends(self, policy, engine):
+        """tools/list must query both :9000 and :9001 and return a unified tool array."""
+        from unittest.mock import AsyncMock, patch
+        from fastapi.testclient import TestClient
+        from src.main import create_app
+        import httpx
+
+        app = create_app(
+            policy_config=policy,
+            graph_manager=engine,
+            downstream_url="http://unprotected:9000/mcp",
+            fetch_downstream_url="http://fetch-backend:9001/mcp",
+        )
+        client = TestClient(app)
+
+        fs_tools = [
+            {"name": "read_text_file", "description": "Read text file", "inputSchema": {}},
+            {"name": "write_file", "description": "Write file", "inputSchema": {}},
+            {"name": "list_directory", "description": "List directory", "inputSchema": {}},
+        ]
+        fetch_tools = [
+            {"name": "fetch", "description": "Fetch a URL from the web", "inputSchema": {}},
+        ]
+
+        async def mock_post(url: str, json: dict, timeout: float = 5.0):
+            if "9000" in url:
+                return httpx.Response(200, json={"jsonrpc": "2.0", "id": json.get("id"), "result": {"tools": fs_tools}})
+            if "9001" in url:
+                return httpx.Response(200, json={"jsonrpc": "2.0", "id": json.get("id"), "result": {"tools": fetch_tools}})
+            raise RuntimeError(f"Unexpected backend URL: {url}")
+
+        with patch("src.main.httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.post.side_effect = mock_post
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            resp = client.post(
+                "/mcp",
+                json={"jsonrpc": "2.0", "method": "tools/list", "params": {}, "id": 10},
+                headers={"X-Session-ID": "multiplex-list-01"},
+            )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        merged_names = [t["name"] for t in body["result"]["tools"]]
+        assert merged_names == ["fs__read_text_file", "fs__write_file", "fs__list_directory", "web__fetch"]
+
+    def test_benign_html_fetch_then_write_file_succeeds(self, policy, engine):
+        """Benign Path: A clean page fetch (:9001) followed by a legitimate
+        write_file (:9000) succeeds without triggering the taint latch.
+        """
+        from unittest.mock import AsyncMock, patch
+        from fastapi.testclient import TestClient
+        from src.main import create_app
+        import httpx
+
+        app = create_app(
+            policy_config=policy,
+            graph_manager=engine,
+            downstream_url="http://unprotected:9000/mcp",
+            fetch_downstream_url="http://fetch-backend:9001/mcp",
+        )
+        client = TestClient(app)
+        sid = "phase4-benign-session-01"
+        clean_html = (self._FIXTURES_DIR / "portal_status.html").read_text(encoding="utf-8")
+        routed_urls: list[str] = []
+
+        async def mock_post(url: str, json: dict, timeout: float = 10.0):
+            routed_urls.append(url)
+            req_id = json.get("id")
+            if "9001" in url:
+                return httpx.Response(
+                    200,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {"content": [{"type": "text", "text": clean_html}]},
+                    },
+                )
+            if "9000" in url:
+                return httpx.Response(
+                    200,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {"content": [{"type": "text", "text": "Successfully wrote to /mcp-proxy-testbed/sandbox/build_status.txt"}]},
+                    },
+                )
+            raise RuntimeError(f"Unexpected URL: {url}")
+
+        with patch("src.main.httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.post.side_effect = mock_post
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            # Step 1: Fetch clean HTML page (routed to :9001)
+            resp1 = client.post(
+                "/mcp",
+                json=_jsonrpc_tool_call(
+                    "fetch",
+                    {"url": "http://fetch-backend:9001/fixtures/portal_status.html"},
+                    req_id=1,
+                ),
+                headers={"X-Session-ID": sid},
+            )
+            assert resp1.status_code == 200
+            assert "result" in resp1.json()
+
+            # Verify session is NOT tainted after clean fetch
+            session, _ = engine._get_session(sid)
+            assert session.is_tainted is False
+            assert session.current_state == ToolState.NETWORK_EGRESS
+
+            # Step 2: Legitimate write_file to /sandbox/build_status.txt (routed to :9000)
+            resp2 = client.post(
+                "/mcp",
+                json=_jsonrpc_tool_call(
+                    "write_file",
+                    {
+                        "path": "/mcp-proxy-testbed/sandbox/build_status.txt",
+                        "content": "Release v2.4.0 Staging: HEALTHY",
+                    },
+                    req_id=2,
+                ),
+                headers={"X-Session-ID": sid},
+            )
+            assert resp2.status_code == 200
+            body2 = resp2.json()
+            assert "error" not in body2
+            assert "result" in body2
+
+        # Verify multi-backend dispatch routed fetch -> :9001 and write_file -> :9000
+        assert routed_urls == [
+            "http://fetch-backend:9001/mcp",
+            "http://unprotected:9000/mcp",
+        ]
+
+    def test_poisoned_html_fetch_triggers_scanner_taint_and_blocks_write_file(self, policy, engine):
+        """Poisoned Path: Fetching portal_update.html (:9001) triggers
+        ingest_scanner.py, latches session.is_tainted = True, and intercepts
+        the subsequent write_file (:9000) with JSON-RPC error -32001.
+        """
+        from unittest.mock import AsyncMock, patch
+        from fastapi.testclient import TestClient
+        from src.main import create_app
+        import httpx
+
+        app = create_app(
+            policy_config=policy,
+            graph_manager=engine,
+            downstream_url="http://unprotected:9000/mcp",
+            fetch_downstream_url="http://fetch-backend:9001/mcp",
+        )
+        client = TestClient(app)
+        sid = "phase4-poisoned-session-01"
+        poisoned_html = (self._FIXTURES_DIR / "portal_update.html").read_text(encoding="utf-8")
+        routed_urls: list[str] = []
+
+        async def mock_post(url: str, json: dict, timeout: float = 10.0):
+            routed_urls.append(url)
+            req_id = json.get("id")
+            if "9001" in url:
+                return httpx.Response(
+                    200,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {"content": [{"type": "text", "text": poisoned_html}]},
+                    },
+                )
+            raise AssertionError(
+                f"Filesystem backend ({url}) must NEVER be called when DFA blocks write_file!"
+            )
+
+        with patch("src.main.httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.post.side_effect = mock_post
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            # Step 1: Fetch poisoned HTML page (routed to :9001)
+            resp1 = client.post(
+                "/mcp",
+                json=_jsonrpc_tool_call(
+                    "fetch",
+                    {"url": "http://fetch-backend:9001/fixtures/portal_update.html"},
+                    req_id=1,
+                ),
+                headers={"X-Session-ID": sid},
+            )
+            assert resp1.status_code == 200
+            assert "result" in resp1.json()
+
+            # Verify ingest_scanner.py latched session.is_tainted = True and set UNTRUSTED_INGEST
+            session, _ = engine._get_session(sid)
+            assert session.is_tainted is True
+            assert session.current_state == ToolState.UNTRUSTED_INGEST
+
+            # Step 2: Attempt cross-server confused deputy write_file to /sandbox/build_status.txt
+            resp2 = client.post(
+                "/mcp",
+                json=_jsonrpc_tool_call(
+                    "write_file",
+                    {
+                        "path": "/mcp-proxy-testbed/sandbox/build_status.txt",
+                        "content": "COMPROMISED VIA CROSS-SERVER HTML INJECTION",
+                    },
+                    req_id=2,
+                ),
+                headers={"X-Session-ID": sid},
+            )
+            assert resp2.status_code == 200
+            body2 = resp2.json()
+            assert body2["jsonrpc"] == "2.0"
+            assert body2["id"] == 2
+            assert body2["error"]["code"] == -32001
+            assert "Security Invariant Violation" in body2["error"]["message"]
+            assert body2["error"]["data"]["current_state"] == "UNTRUSTED_INGEST"
+            assert body2["error"]["data"]["target_state"] == "LOCAL_WRITE"
+
+        # Confirm only :9001 was contacted; :9000 never received the blocked write_file
+        assert routed_urls == ["http://fetch-backend:9001/mcp"]
+
 

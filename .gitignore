@@ -1,3 +1,7 @@
 
 __pycache__/
 *.pyc
+
+# Eval holdout per-scenario results (aggregate only in summary.md)
+eval/**/.holdout/
+.pytest_cache/
