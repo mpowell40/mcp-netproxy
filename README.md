@@ -290,11 +290,3 @@ Boundary and redirect attacks were all blocked. All three misses (LA06–LA08) s
 
 ---
 
-## Known Limitations
-
-- **Edit content isn't inspected (A21):** a malicious config edit has the same structure as a benign one, so it isn't blocked.
-- **Exfiltration to allowlisted hosts:** if a host is on the egress allowlist, data carried in its URL or query is not inspected. This accounts for the live-set exfiltration misses.
-- **Regex-based injection scanning:** the scanner catches imperative directive patterns but can be evaded by paraphrasing, and live pages can carry injections it doesn't recognize.
-- **Testbed-only exception:** `fetch-backend` is listed under `private_hosts` so fixtures can be fetched over Docker's internal network. A real deployment should leave `private_hosts` empty.
-- **Command execution is out of scope:** `EXECUTE`-mapped tools exist in the policy, but no execution backend is deployed.
-- **Absolute paths only:** relative paths are refused, because the proxy can't know the backend's working directory.
