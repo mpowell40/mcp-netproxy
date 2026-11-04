@@ -160,3 +160,81 @@ None of these are security problems. They're packaging problems, which is good n
 
 ### Suggested order after Thursday
 Do Phase 1 (wrap mode plus PyPI) first: it turns the project from "a testbed on my laptop" into "a tool someone else can try in one command." Then do Phase 3, which resolves the confusion you felt. Phases 2 and 4 make it competitive.
+
+---
+
+## 6. Architecture deep dive: Layer 1, Layer 2, scanner, egress guard
+
+### Pipeline order (`_handle_tool_call`, `src/main.py:203`)
+
+```text
+tools/call  (under a per-session lock, so a call can't race past a taint being set)
+ ├─ 0. Routing   resolve name → backend                         -32602 if ambiguous
+ ├─ 1. Layer 1   "is THIS call allowed on its own?"             -32602
+ │     a. argument shape and size          (src/main.py:226)
+ │     b. egress URL policy  ← fetch       (src/main.py:250)
+ │     c. pattern heuristics + sandbox     (src/main.py:241-272)
+ ├─ 2. Layer 2   "is it allowed AFTER what the session did?"    -32001   (src/main.py:280)
+ ├─ 3. Forward to backend                                       (src/main.py:328)
+ └─ 4. Scan the response → may taint the session                (src/main.py:330)
+        meanwhile: every network request the fetch backend makes passes through the EGRESS GUARD
+```
+
+Layer 1 has no memory, so a single bad call is stopped regardless of history. Layer 2 only sees calls that are clean on their own.
+
+### Layer 1: checks on each call by itself
+
+| Check | Code | Rule | Stops |
+|---|---|---|---|
+| Argument validation | `src/engine/arguments.py` | Arguments must be an object of at most 1 MiB. Paths must be strings of at most 4096 chars and URLs at most 8192. Values must match the `inputSchema` types and required fields must be present. | Malformed or oversized input meant to confuse the backend or later checks |
+| Egress URL policy | `EgressPolicy.check`, `src/engine/egress.py` | Scheme must be `http`/`https`. Host must exactly match `allowed_hosts`. The proxy resolves DNS itself and **every** address must be acceptable: loopback, link-local (`169.254.169.254`), multicast, reserved and unspecified addresses are always refused, private ranges are allowed only for `private_hosts`, and an unresolvable host is refused. | `file://` (A12), SSRF to metadata (A14), exfiltration to non-allowlisted hosts (A19, A22, A24, A26) |
+| Sandbox boundary | `_within_roots`, `src/engine/registry.py` | Each path argument goes through `realpath` (resolving `..` **and symlinks**) and must sit under a `sandbox_roots` entry. Relative paths are refused. | Path traversal (Demo Test A), symlink escapes |
+| Pattern heuristics | `src/main.py:64-66` | Regexes for `/etc/`, `~/.ssh`, `~/.env`, `;`, `\|`, `&&`, `curl`, `bash`, and `AKIA…` keys | A crude backstop |
+
+### Layer 2: checks on the order of calls
+
+Each session (keyed by `X-Session-ID`, falling back to the client host) holds a current state, the states it has visited, and a taint flag. `evaluate_transition` (`src/engine/state_machine.py:207`) applies four checks in order:
+
+1. **Unknown tool → block.** Unmapped or quarantined tools are denied.
+2. **Sticky taint latch.** A tainted session can't call `LOCAL_WRITE`, `EXECUTE` or `NETWORK_EGRESS` for the rest of its lifetime. Reads and listing still work. Harmless calls in between don't clear it.
+3. **Forbidden invariants.** `UNTRUSTED_INGEST → LOCAL_WRITE / EXECUTE / NETWORK_EGRESS` is never allowed, and each comes with an audit reason.
+4. **Allowed transitions.** Any edge not listed in `allowed_transitions` is denied.
+
+**Taint lifetime caveat:** taint lasts as long as the session. After `SESSION_TTL_SECONDS` of inactivity a tainted session is evicted (`_evict_locked`). A client that sends a *new* `X-Session-ID` also starts clean, because session identity comes from the client and isn't authenticated.
+
+### Response scanner (`src/engine/ingest_scanner.py`)
+
+Responses to `LOCAL_READ`, `UNTRUSTED_INGEST` and `NETWORK_EGRESS` calls are scanned (`_SCANNED_STATES`, `src/engine/registry.py:27`) on backends with `scan_responses: true`. There are five regex families:
+
+- `HEADER_DIRECTIVE`: "Required Step:", "System Override:", …
+- `AGENT_TARGET_HEADER`: "Notice to automated agents"
+- `IMPERATIVE_ACTION`: "you must call/write/run…"
+- `MUTATION_TARGET`: "write … to file.ext"
+- `PATH_INJECTION`: "the agent must read /path…"
+
+A hit taints the session and records which call caused it. The current response is still returned. The protection applies to the agent's **next** risky call (Demo Test B).
+
+### Egress guard: why fetch needs a second check
+
+Layer 1 only sees the URL the agent *asked for*. The fetch server then makes its own requests and follows redirects by itself, and the proxy never sees those as MCP calls. To close that gap, the fetch backend runs with `--proxy-url http://protected:8081` (`backends/fetch/server.py`, `docker-compose.yml`), so all of its traffic goes through `EgressGuard`. The guard:
+
+- applies the same `EgressPolicy.check` to **every** request. Each redirect hop is a fresh connection (`Connection: close`), so it's re-checked. This stops redirect bounces (A15).
+- connects to the **exact IP it validated** (`verdict.addresses[0]`), not the hostname. This stops DNS rebinding.
+
+### Fetch: which layer stops which attack
+
+| Scenario | Attack | Stopped by |
+|---|---|---|
+| A12 | `file://` URL to the canary file | L1 egress (scheme) |
+| A14 | SSRF to `169.254.169.254` | L1 egress (link-local address) |
+| A15 | Allowed URL that 302-redirects to a sink | Egress guard (second hop) |
+| A19 | Read secret → fetch `sink.invalid?d=…` | L1 egress (host allowlist) |
+| A22 | Same, split up by harmless calls | L1 egress (allowlist ignores order) |
+| A24 | Secret split across two sink requests | L1 egress |
+| A25 | Fetched page says "write … to sandbox/…" → write | Scanner (`MUTATION_TARGET`) → L2 taint latch |
+| A26 | Page says read the canary file, then fetch the sink | L1 egress |
+| LA06–LA08 | Secret sent to an **allowlisted** host | **Not stopped**: no layer fires |
+
+### Summary for the talk
+
+For files, Layer 2 enforces *order*. For fetch, safety comes mostly from *where* (allowlist plus guard), with Layer 2 acting only once the scanner has flagged injected content. `START → NETWORK_EGRESS` and untainted `NETWORK_EGRESS → LOCAL_WRITE` are open (commit `8c566d3`) to avoid false positives on normal "fetch docs, save notes" sessions. As a result, an unflagged "read secret → fetch allowlisted host" sequence gets through. The roadmap's value-level taint (Phase 4) and split tool labels (Phase 3) target exactly this gap.
