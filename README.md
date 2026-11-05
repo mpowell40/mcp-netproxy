@@ -37,7 +37,7 @@ Autonomous AI agents interact with local and remote environments by invoking str
                                      - Drops with -32602 Invalid Params
                                                       ||
                                   [Layer 2: Stateful DFA Invariant Engine]
-                                     - Tracks session state via X-Session-ID
+                                     - Tracks session via proxy-issued token
                                      - Enforces invariants across tool turns
                                      - Drops with -32001 Invariant Violation
                                                       ||
@@ -58,10 +58,17 @@ Autonomous AI agents interact with local and remote environments by invoking str
 - Immediately terminates malicious calls with JSON-RPC error code `-32602 (Invalid Params)`: `[SECURITY BLOCKED - HEURISTIC]`.
 
 ### 2. Layer 2: Stateful Behavioral DFA Engine
-- Tracks session state trajectories using thread-safe, in-memory session managers keyed by `X-Session-ID` (with fallback to client IP).
+- Tracks session state trajectories using thread-safe, in-memory session managers keyed by **proxy-issued session tokens** (see [Sessions](#sessions)).
 - Maps tool calls to formal states: `START`, `DISCOVERY`, `LOCAL_READ`, `LOCAL_WRITE`, `UNTRUSTED_INGEST`, `EXECUTE`, and `NETWORK_EGRESS`.
 - Enforces strict transition invariants declared in `config/policy.yaml`. Transitions such as `UNTRUSTED_INGEST -> LOCAL_WRITE` are blocked with JSON-RPC error code `-32001 (Security Invariant Violation)`: `[SECURITY BLOCKED - DFA INVARIANT]`.
 - Before the transition graph, checks the session's provenance labels against the policy's label sink rules (see below).
+
+### Sessions
+- Every MCP `initialize` gets a fresh, unguessable token in the `Mcp-Session-Id` response header, and every later request on that connection must send it back. A request with no token is rejected with HTTP 400, and one with an unknown or expired token gets HTTP 404 (JSON-RPC `-32600`). Neither reaches a backend. Clients can't choose, share or switch session IDs, so they can't shed labels or taint or reach another client's session.
+- Each token maps to a **public id** (`sess-…`, also returned in `X-Proxy-Session`). Logs, telemetry and `/session/<id>` use the public id. The token itself is never logged.
+- Sessions expire after `SESSION_TTL_SECONDS` idle. `DELETE /mcp` with the token ends one early, and `GET /sessions` lists live sessions with their labels and taint status.
+- `MCP_SESSION_MODE=legacy` brings back the old client-chosen `X-Session-ID` (fallback: client IP). It exists for unit tests and old clients only.
+- The Claude Desktop bridge (`scripts/claude_stdio_bridge.py`) stores the token and sends it on every request, so each Claude Desktop connection is its own session. To start clean, turn the server off and on in Claude Desktop's settings; you don't need to restart the proxy. Claude Desktop shares one connection across all chats and MCP carries no conversation ID, so sessions are per connection, not per chat. The bridge writes `[bridge] proxy session sess-…` to Claude Desktop's MCP log.
 
 ### 2a. Provenance Labels (Phase 5 information flow control)
 - A session is labeled by **where** its data came from, never by what the data says. `untrusted` (integrity) comes from every `web__fetch` response and from `sandbox/**/inbox/**`; `secret` (confidentiality) comes from `**/secrets/**`, `**/*.env` and `**/credentials*`. Globs match the canonical realpath.
@@ -142,7 +149,23 @@ docker compose up -d --build
 Overlays: add `-f compose/eval.yml` for evaluation runs, or `-f compose/live.yml`
 to allow a few public websites (see `eval/README.md`).
 
-### 2. Run Automated Verification Tests
+### 2. Send a Request
+
+Open a session with `initialize`, then send its token on every call:
+
+```powershell
+$init = Invoke-WebRequest -Method Post -Uri http://localhost:8000/mcp -ContentType "application/json" `
+  -Body '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"clientInfo":{"name":"manual"}}}'
+$session = @{ "Mcp-Session-Id" = [string]$init.Headers["Mcp-Session-Id"] }
+[string]$init.Headers["X-Proxy-Session"]   # public id, for /session/<id>
+
+Invoke-RestMethod -Method Post -Uri http://localhost:8000/mcp -ContentType "application/json" -Headers $session `
+  -Body '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fs__read_text_file","arguments":{"path":"/mcp-proxy-testbed/sandbox/../service_catalog.json"}}}' | ConvertTo-Json -Depth 10
+
+curl.exe -s http://localhost:8000/sessions
+```
+
+### 3. Run Automated Verification Tests
 
 Execute the full pytest suite:
 
@@ -185,7 +208,7 @@ WARNING - [SECURITY BLOCKED - HEURISTIC] Intercepted 'read_text_file' (Malicious
 
 * **Proxy Telemetry:**
 ```text
-WARNING - [SECURITY BLOCKED - DFA INVARIANT] Session 'claude-desktop-client' denied transition: tool='write_file', state='UNTRUSTED_INGEST' -> 'LOCAL_WRITE', reason='Untrusted ingestion cannot directly mutate local files (mitigating indirect prompt injection).'
+WARNING - [SECURITY BLOCKED - DFA INVARIANT] Session 'sess-…' denied transition: tool='write_file', state='UNTRUSTED_INGEST' -> 'LOCAL_WRITE', reason='Untrusted ingestion cannot directly mutate local files (mitigating indirect prompt injection).'
 ```
 
 ---

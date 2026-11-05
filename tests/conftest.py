@@ -1,6 +1,8 @@
 """Shared test configuration.
 
-Most tests exercise the DFA, scanner and routing with arbitrary example URLs,
+Most tests address sessions with the legacy ``X-Session-ID`` header (tests
+marked ``@pytest.mark.session_tokens`` use proxy-issued tokens), and most
+exercise the DFA, scanner and routing with arbitrary example URLs,
 so the deployment's egress allowlist is bypassed for them.  Tests marked
 ``@pytest.mark.egress`` run the real URL policy (see tests/test_egress.py).
 
@@ -17,6 +19,18 @@ from src.engine.egress import EgressPolicy, EgressVerdict
 
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", "egress: run the real egress URL policy instead of bypassing it")
+    config.addinivalue_line(
+        "markers", "session_tokens: run with proxy-issued session tokens instead of legacy X-Session-ID"
+    )
+
+
+@pytest.fixture(autouse=True)
+def _legacy_sessions_unless_marked(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Most tests address sessions by X-Session-ID; token-mode tests opt in."""
+    if request.node.get_closest_marker("session_tokens"):
+        monkeypatch.setenv("MCP_SESSION_MODE", "token")
+    else:
+        monkeypatch.setenv("MCP_SESSION_MODE", "legacy")
 
 
 @pytest.fixture(autouse=True)
