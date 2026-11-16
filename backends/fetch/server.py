@@ -142,6 +142,17 @@ async def serve_fixture(filename: str):
     return HTMLResponse(content=target.read_text(encoding="utf-8"), status_code=200)
 
 
+@app.get("/redirect")
+async def redirect(to: str):
+    """Demo-only open redirect on an allowlisted host.
+
+    Layer 1 approves ``http://fetch-backend:9001/redirect?to=...`` because the
+    host is allowlisted; the fetch server then follows the 302 by itself, and
+    only the proxy's egress guard sees (and refuses) that second hop.
+    """
+    return Response(status_code=302, headers={"Location": to})
+
+
 @app.post("/mcp")
 async def handle_mcp(request: Request):
     global proc

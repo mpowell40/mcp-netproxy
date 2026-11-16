@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mcp-netproxy live</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --ink: #1c2330; --muted: #5d6779; --line: #e1e5eb;
+    --allow: #1f7a4d; --allow-bg: #e3f4ea; --block: #b42318; --block-bg: #fde8e6;
+    --warn: #8a5a00; --warn-bg: #fff3d6; --info: #1d4f91; --info-bg: #e5eefb;
+    --untrusted: #8a3ffc; --untrusted-bg: #efe6ff; --secret: #b42318; --secret-bg: #fde8e6;
+    --accent: #1d4f91;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1218; --panel: #171b23; --ink: #e6e9ef; --muted: #98a2b3; --line: #2a303b;
+      --allow: #5fd09a; --allow-bg: #13301f; --block: #ff8a80; --block-bg: #3a1714;
+      --warn: #ffcc66; --warn-bg: #3a2c0c; --info: #8fb8ff; --info-bg: #142640;
+      --untrusted: #c4a3ff; --untrusted-bg: #2a1d45; --secret: #ff8a80; --secret-bg: #3a1714;
+      --accent: #8fb8ff;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { display: flex; align-items: center; gap: 16px; padding: 12px 20px;
+           border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
+  header h1 { font-size: 17px; margin: 0; font-weight: 650; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); display: inline-block; }
+  .dot.up { background: var(--allow); } .dot.down { background: var(--block); }
+  .stats { display: flex; gap: 10px; margin-left: auto; flex-wrap: wrap; }
+  .stat { padding: 4px 10px; border-radius: 999px; background: var(--bg); border: 1px solid var(--line); font-size: 13px; }
+  .stat b { font-variant-numeric: tabular-nums; }
+  main { display: grid; grid-template-columns: 260px 1fr 340px; gap: 16px; padding: 16px 20px; align-items: start; }
+  @media (max-width: 1100px) { main { grid-template-columns: minmax(0, 1fr); } }
+  @media (max-width: 600px) { main { padding: 12px 16px; } header { padding: 10px 16px; } .stats { margin-left: 0; } }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; min-width: 0; }
+  h2 .sid { text-transform: none; letter-spacing: 0; font-family: ui-monospace, Consolas, monospace; color: var(--ink); }
+  .tablewrap { overflow-x: auto; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px; }
+  .muted { color: var(--muted); }
+  .sess { padding: 8px 10px; border-radius: 8px; cursor: pointer; border: 1px solid transparent; margin-bottom: 6px; }
+  .sess:hover { background: var(--bg); }
+  .sess.sel { border-color: var(--accent); background: var(--info-bg); }
+  .sess .id { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; }
+  .chip { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; margin: 2px 4px 2px 0; }
+  .chip.untrusted { color: var(--untrusted); background: var(--untrusted-bg); }
+  .chip.secret { color: var(--secret); background: var(--secret-bg); }
+  .chip.other { color: var(--info); background: var(--info-bg); }
+  .path { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin: 6px 0 12px; }
+  .state { font-family: ui-monospace, Consolas, monospace; font-size: 12px; padding: 2px 7px; border-radius: 6px;
+           background: var(--bg); border: 1px solid var(--line); }
+  .arrow { color: var(--muted); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--muted); font-weight: 600; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  td { padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  td.tool { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; white-space: nowrap; }
+  td.time { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .verdict { font-weight: 700; font-size: 12px; padding: 2px 8px; border-radius: 6px; white-space: nowrap; }
+  .verdict.ALLOW { color: var(--allow); background: var(--allow-bg); }
+  .verdict.BLOCK { color: var(--block); background: var(--block-bg); }
+  .verdict.ALERT { color: var(--warn); background: var(--warn-bg); }
+  .verdict.LABEL { color: var(--untrusted); background: var(--untrusted-bg); }
+  tr.new td { animation: flash 1.6s ease-out; }
+  @keyframes flash { from { background: var(--warn-bg); } to { background: transparent; } }
+  .layer { font-size: 12px; color: var(--muted); }
+  .reason { overflow-wrap: anywhere; }
+  .q { border-left: 3px solid var(--block); padding: 6px 10px; margin-bottom: 8px; background: var(--block-bg); border-radius: 0 6px 6px 0; }
+  .q .tool { font-family: ui-monospace, Consolas, monospace; font-weight: 600; }
+  .alert { padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+  .empty { color: var(--muted); font-style: italic; padding: 8px 0; }
+  .origins { font-size: 12px; color: var(--muted); margin: 0 0 10px; }
+  .origins div { overflow-wrap: anywhere; }
+  label.follow { font-size: 12px; color: var(--muted); display: flex; gap: 6px; align-items: center; margin-bottom: 8px; }
+  .pins { font-size: 12.5px; }
+</style>
+</head>
+<body>
+<header>
+  <span id="dot" class="dot"></span>
+  <h1>mcp-netproxy &middot; live enforcement</h1>
+  <span class="muted" id="updated">connecting&hellip;</span>
+  <div class="stats">
+    <span class="stat">sessions <b id="s-sessions">0</b></span>
+    <span class="stat">allowed <b id="s-allow">0</b></span>
+    <span class="stat">blocked <b id="s-block">0</b></span>
+    <span class="stat">quarantined tools <b id="s-quar">0</b></span>
+  </div>
+</header>
+<main>
+  <section>
+    <h2>Sessions</h2>
+    <label class="follow"><input type="checkbox" id="follow" checked> follow newest session</label>
+    <div id="sessions"><div class="empty">No sessions yet. Connect a client (Claude Desktop, demo script).</div></div>
+  </section>
+
+  <section>
+    <h2 id="sel-title">Session</h2>
+    <div id="labels"></div>
+    <div id="origins" class="origins"></div>
+    <div class="muted" style="font-size:12px">State path (Layer 2 DFA)</div>
+    <div class="path" id="path"><span class="empty">&mdash;</span></div>
+    <div class="tablewrap"><table>
+      <thead><tr><th>Time</th><th>Tool</th><th>Decision</th><th>Layer / check</th><th>Reason</th></tr></thead>
+      <tbody id="timeline"><tr><td colspan="5" class="empty">Select a session.</td></tr></tbody>
+    </table></div>
+  </section>
+
+  <section>
+    <h2>Tool manifest</h2>
+    <div id="manifest-mode" class="muted" style="font-size:12px;margin-bottom:8px"></div>
+    <div id="quarantine"></div>
+    <h2 style="margin-top:14px">Manifest alerts</h2>
+    <div id="malerts"><div class="empty">None.</div></div>
+    <h2 style="margin-top:14px">Pinned tools</h2>
+    <div id="pins" class="pins"></div>
+  </section>
+</main>
+
+<script>
+// Read-only view over the proxy's existing endpoints: /sessions,
+// /session/{id}, /session/{id}/events and /manifest.  Polls once a second.
+"use strict";
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const LAYERS = { heuristic: "L1", dfa: "L2", routing: "routing", manifest: "manifest" };
+let selected = null;
+let seenEvents = new Set();
+let firstRender = true;
+
+async function getJSON(path) {
+  const r = await fetch(path, { cache: "no-store" });
+  if (!r.ok) throw new Error(path + " " + r.status);
+  return r.json();
+}
+
+function chip(label) {
+  const cls = label === "untrusted" || label === "secret" ? label : "other";
+  return `<span class="chip ${cls}">${esc(label)}</span>`;
+}
+
+function timeOf(iso) {
+  const d = new Date(iso);
+  return isNaN(d) ? "" : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+// One timeline row per meaningful event.
+function rowsFor(events) {
+  const rows = [];
+  for (const e of events) {
+    const d = e.details || {};
+    if (e.event_type === "BEFORE_TOOL_CALL") {
+      const verdict = e.decision === "BLOCK" ? "BLOCK" : "ALLOW";
+      let layer = verdict === "BLOCK" ? (LAYERS[d.layer] || d.layer || "") : "";
+      if (verdict === "BLOCK" && d.check) layer += " · " + d.check;
+      const reason = verdict === "BLOCK" ? d.reason
+        : (d.current_state && d.target_state ? `${d.current_state} → ${d.target_state}` : "");
+      rows.push({ id: e.event_id, t: e.timestamp, tool: e.tool_name, verdict, layer, reason });
+    } else if (e.event_type === "AFTER_TOOL_CALL") {
+      for (const o of d.labels_applied || []) {
+        rows.push({ id: e.event_id + o.label, t: e.timestamp, tool: e.tool_name, verdict: "LABEL",
+                    layer: "provenance", reason: `session labeled ${o.label} (${o.rule}: ${o.source})` });
+      }
+      for (const a of d.alerts || []) {
+        rows.push({ id: e.event_id + "a", t: e.timestamp, tool: e.tool_name, verdict: "ALERT",
+                    layer: "scanner (alert only)", reason: a.reason || a.pattern_id });
+      }
+    } else if (e.event_type === "AFTER_TOOL_LIST" && d.layer === "manifest") {
+      rows.push({ id: e.event_id, t: e.timestamp, tool: e.tool_name, verdict: e.decision === "BLOCK" ? "BLOCK" : "ALERT",
+                  layer: "manifest · " + (d.manifest_status || ""), reason: (e.decision === "BLOCK" ? "withheld from tools/list: " : "") + (d.reason || "") });
+    }
+  }
+  return rows;
+}
+
+function renderSessions(rows) {
+  $("s-sessions").textContent = rows.length;
+  if (!rows.length) {
+    $("sessions").innerHTML = '<div class="empty">No sessions yet. Connect a client (Claude Desktop, demo script).</div>';
+    return;
+  }
+  rows.sort((a, b) => b.created_at - a.created_at);
+  if ($("follow").checked || !rows.some((r) => r.session_id === selected)) selected = rows[0].session_id;
+  $("sessions").innerHTML = rows.map((r) => `
+    <div class="sess ${r.session_id === selected ? "sel" : ""}" data-id="${esc(r.session_id)}">
+      <div class="id">${esc(r.session_id)}</div>
+      <div class="muted" style="font-size:12px">${esc(r.client_name || "client")} · ${esc(r.current_state)} · idle ${Math.round(r.idle_seconds)}s</div>
+      <div>${(r.labels || []).map(chip).join("")}</div>
+    </div>`).join("");
+  for (const el of document.querySelectorAll(".sess")) {
+    el.onclick = () => { selected = el.dataset.id; $("follow").checked = false; tick(); };
+  }
+}
+
+function renderSession(ctx, events) {
+  $("sel-title").innerHTML = 'Session <span class="sid">' + esc(selected) + "</span>";
+  const labels = Object.keys(ctx?.labels || {});
+  $("labels").innerHTML = labels.length ? labels.map(chip).join("") : '<span class="muted">No labels: clean session</span>';
+  $("origins").innerHTML = labels.map((l) => (ctx.labels[l] || []).slice(0, 3)
+      .map((o) => `<div>${esc(l)} ← ${esc(o.source)} <span class="muted">(${esc(o.rule)})</span></div>`).join("")).join("");
+  const hist = ctx?.state_history || [];
+  // state_history already starts with START
+  $("path").innerHTML = (hist.length ? hist : [{ state: "START", tool_invoked: "" }])
+    .map((h, i) => `${i ? '<span class="arrow">→</span>' : ""}<span class="state" title="${esc(h.tool_invoked || "")}">${esc(h.state)}</span>`)
+    .join("");
+
+  const rows = rowsFor(events).reverse();
+  if (!rows.length) { $("timeline").innerHTML = '<tr><td colspan="5" class="empty">No tool calls yet.</td></tr>'; return; }
+  $("timeline").innerHTML = rows.map((r) => {
+    const isNew = !firstRender && !seenEvents.has(r.id);
+    seenEvents.add(r.id);
+    return `<tr class="${isNew ? "new" : ""}"><td class="time">${timeOf(r.t)}</td><td class="tool">${esc(r.tool)}</td>
+      <td><span class="verdict ${r.verdict}">${r.verdict}</span></td><td class="layer">${esc(r.layer)}</td>
+      <td class="reason">${esc(r.reason)}</td></tr>`;
+  }).join("");
+}
+
+function renderManifest(m) {
+  if (!m.enabled) { $("manifest-mode").textContent = "Manifest checks disabled in policy."; return; }
+  $("manifest-mode").textContent = `mode: ${m.mode} · description scan: ${m.scan_descriptions ? "on" : "off"}`;
+  const q = Object.entries(m.quarantined || {});
+  $("s-quar").textContent = q.length;
+  $("quarantine").innerHTML = q.length ? q.map(([tool, e]) =>
+      `<div class="q"><div class="tool">${esc(tool)} <span class="chip other">${esc(e.status)}</span></div><div class="reason" style="font-size:12.5px">${esc(e.reason)}</div></div>`).join("")
+    : '<div class="empty">No quarantined tools.</div>';
+  const alerts = (m.alerts || []).slice(-6).reverse();
+  $("malerts").innerHTML = alerts.length ? alerts.map((a) =>
+      `<div class="alert"><b>${esc(a.status)}</b> <span class="tool">${esc(a.tool)}</span><div class="muted reason">${esc(a.reason)}</div></div>`).join("")
+    : '<div class="empty">None.</div>';
+  $("pins").innerHTML = Object.entries(m.pins || {}).map(([ns, tools]) =>
+      `<div><b>${esc(ns)}</b>: ${Object.keys(tools).length} tool${Object.keys(tools).length === 1 ? "" : "s"}</div>`).join("") || '<div class="empty">Nothing pinned yet.</div>';
+}
+
+async function tick() {
+  try {
+    const [sess, manifest] = await Promise.all([getJSON("/sessions"), getJSON("/manifest")]);
+    renderSessions(sess.sessions || []);
+    renderManifest(manifest);
+    let allow = 0, block = 0;
+    const sessions = (sess.sessions || []).slice(0, 12);
+    const all = await Promise.all(sessions.map((s) => getJSON(`/session/${encodeURIComponent(s.session_id)}/events`).catch(() => ({ events: [] }))));
+    all.forEach((r) => r.events.forEach((e) => {
+      if (e.event_type === "BEFORE_TOOL_CALL") (e.decision === "BLOCK" ? block++ : allow++);
+    }));
+    $("s-allow").textContent = allow; $("s-block").textContent = block;
+    if (selected) {
+      const idx = sessions.findIndex((s) => s.session_id === selected);
+      const events = idx >= 0 ? all[idx].events : (await getJSON(`/session/${encodeURIComponent(selected)}/events`)).events;
+      const ctx = await getJSON(`/session/${encodeURIComponent(selected)}`).catch(() => null);
+      renderSession(ctx, events);
+    }
+    firstRender = false;
+    $("dot").className = "dot up";
+    $("updated").textContent = "live · " + new Date().toLocaleTimeString();
+    if (sess.session_mode && sess.session_mode !== "token") $("updated").textContent += " · legacy session mode (sessions not listed)";
+  } catch (err) {
+    $("dot").className = "dot down";
+    $("updated").textContent = "proxy unreachable: " + err.message;
+  }
+}
+
+tick();
+setInterval(tick, 1000);
+</script>
+</body>
+</html>

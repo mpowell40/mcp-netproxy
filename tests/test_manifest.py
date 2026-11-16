@@ -330,3 +330,16 @@ class TestProxyEnforcement:
             listed = client.post("/mcp", json=_tools_list(), headers={"X-Session-ID": "mf-07"})
             assert client.get("/manifest").json() == {"enabled": False}
         assert "notes__add_note" in _names(listed)
+
+
+class TestDashboard:
+
+    def test_dashboard_served_and_self_contained(self):
+        resp = TestClient(_app()).get("/dashboard")
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/html")
+        html = resp.text
+        for endpoint in ("/sessions", "/manifest", "/events"):
+            assert endpoint in html
+        # Works offline: no external scripts, styles or fonts
+        assert "http://" not in html and "https://" not in html

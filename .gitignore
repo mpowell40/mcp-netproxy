@@ -5,3 +5,6 @@ __pycache__/
 # Eval holdout per-scenario results (aggregate only in summary.md)
 eval/**/.holdout/
 .pytest_cache/
+
+# scripts/demo.py output
+sandbox/demo-out/

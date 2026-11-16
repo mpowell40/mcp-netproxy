@@ -179,6 +179,7 @@ mcp-proxy-testbed/
 │   └── phase-3-test/               #   fixtures for the Claude Desktop demo (inbox/ = untrusted by provenance)
 ├── tests/                          # pytest unit + integration tests (no Docker needed)
 ├── scripts/claude_stdio_bridge.py  # Stdio → HTTP bridge so Claude Desktop can use the proxy
+├── scripts/demo.py                 # Narrated demo of every protection (pre-flight check)
 ├── service_catalog.json            # Fake "sensitive" file outside sandbox/ (traversal target)
 ├── scripts/reproduce.sh, .ps1      # Clean clone -> reported results, checked per scenario
 ├── eval/compare_runs.py            # Compares a fresh run with a committed one
@@ -336,12 +337,26 @@ The bridge stores the proxy-issued session token, so each Claude Desktop connect
 
 ---
 
+## Live dashboard and scripted demo
+
+- **Dashboard:** <http://localhost:8000/dashboard> is a read-only page served by the proxy that updates every second. It shows:
+  - live sessions with their `untrusted` / `secret` labels and where they came from
+  - each session's state path
+  - a timeline of every decision (ALLOW / BLOCK, layer and check, reason)
+  - scanner alerts
+  - the tool manifest (pinned tools, quarantined tools, alerts)
+  
+  It uses no external resources, so it works offline.
+- **Scripted demo:** `python scripts/demo.py` replays one attack per protection (D1–D10) plus benign controls (B1–B3). It prints what the proxy did and, where possible, what happens without it. It exits non-zero if anything behaves unexpectedly, so it doubles as a pre-flight check. Run `python scripts/demo.py --list` to see the demos.
+- **Runbook:** [docs/DEMO_RUNBOOK.md](docs/DEMO_RUNBOOK.md) has the pre-flight checklist, the exact Claude Desktop prompts for each protection, what to point at on the dashboard, and fallbacks.
+
 ## Inspecting Sessions
 
 | Endpoint | Returns |
 | --- | --- |
 | `GET /sessions` | Live sessions with their labels |
 | `GET /manifest` | Pinned tool fingerprints, quarantined tools and manifest alerts |
+| `GET /dashboard` | Live HTML view of all of the above |
 | `GET /session/{id}` | State history, current state, labels with their origins, scanner alerts |
 | `GET /session/{id}/events` | Checkpoint telemetry (`BEFORE/AFTER_TOOL_LIST`, `BEFORE/AFTER_TOOL_CALL`) with decision and layer |
 | `GET /session/{id}/graph` | Mermaid state diagram of the session's trajectory |

@@ -36,6 +36,7 @@ from typing import Any, Callable
 import httpx
 import uvicorn
 from fastapi import FastAPI, Request, Response
+from fastapi.responses import HTMLResponse
 
 from src.engine.egress import EgressGuard
 from src.engine.events import Checkpoint, Decision, EventCollector, ProxyEvent
@@ -75,6 +76,7 @@ AWS_KEY_PATTERN = r"(AKIA[0-9A-Z]{16})"
 
 # Namespace that ``fetch_downstream_url`` overrides (legacy create_app kwarg)
 _FETCH_NAMESPACE = "web"
+_DASHBOARD = pathlib.Path(__file__).resolve().parent / "static" / "dashboard.html"
 # Overrides manifest.store_path (tests, alternate deployments)
 MANIFEST_STORE_ENV = "MCP_MANIFEST_STORE"
 
@@ -312,6 +314,15 @@ def create_app(
     # -----------------------------------------------------------------------
     # GET /sessions  –  live sessions (public ids only)
     # -----------------------------------------------------------------------
+    @app.get("/dashboard", response_class=HTMLResponse)
+    async def dashboard() -> HTMLResponse:
+        """Read-only live view of sessions, decisions, labels and the tool manifest.
+
+        A static page that polls /sessions, /session/{id}, /session/{id}/events
+        and /manifest; it adds no new data and changes nothing.
+        """
+        return HTMLResponse(_DASHBOARD.read_text(encoding="utf-8"))
+
     @app.get("/manifest")
     async def manifest_state() -> dict:
         """Pinned tool fingerprints, quarantined tools and manifest alerts."""
