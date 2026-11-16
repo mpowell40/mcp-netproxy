@@ -1,3 +1,8 @@
+# Fixed project name: plain `docker compose up` (from any checkout folder) and
+# scripts/reproduce.* manage the same containers instead of colliding on the
+# fixed container names below.
+name: mcp-netproxy
+
 services:
   protected:
     container_name: mcp-protected
