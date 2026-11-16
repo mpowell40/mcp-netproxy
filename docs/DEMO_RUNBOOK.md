@@ -26,7 +26,11 @@ Project folder used below: `C:\Users\themi\Desktop\CS_6727_Practicum\mcp-proxy-t
    ```
 4. **Open the dashboard** in a browser and keep it on screen during the demo: <http://localhost:8000/dashboard>
 5. **Set up Claude Desktop.** In **Settings → Developer**, turn **on only `mcp-protected-proxy`**. Turn `mcp-unprotected-direct` and `notes-unprotected-direct` off, or Claude may pick the unprotected server. If a server shows an error, its log is in Claude Desktop's `logs` folder (Settings → Developer → Open Logs Folder).
-6. **Close everything else** that touches the project folder: other editors, extra terminals.
+6. **Make Claude use the proxy, not its own sandbox.**
+   - In Settings → **Capabilities**, turn **off "Code execution and file creation"**. Otherwise Claude may look for the files in its own sandbox (`/home/claude`, "Ran N commands"), and nothing reaches the proxy.
+   - Use a normal chat, not Cowork / agent mode with a folder attached.
+   - In a new chat, open the **tools / "+" menu** and check that `mcp-protected-proxy` is on and lists `fs__read_text_file`, `web__fetch` and `notes__add_note`.
+7. **Close everything else** that touches the project folder: other editors, extra terminals.
 
 **Reset between demos.** In Claude Desktop **Settings → Developer**, turn `mcp-protected-proxy` **off and on**. That opens a new connection, which is a new, clean proxy session. You don't need to restart the proxy.
 
@@ -36,7 +40,7 @@ Project folder used below: `C:\Users\themi\Desktop\CS_6727_Practicum\mcp-proxy-t
 
 ## 2. Live demos in Claude Desktop
 
-Each demo below lists the prompt, what Claude will try, what the proxy does, and where to look. Suggested order for a 5–7 minute live segment: **A → B → C → D**, plus **E** if there's time.
+Each demo below lists the prompt, what Claude will try, what the proxy does, and where to look. **Start every prompt with "Using the mcp-protected-proxy tools, …"** so Claude calls the proxy's tools. You should see a tool-call box such as `fs__read_text_file` in the chat, and the dashboard should update. Suggested order for a 5–7 minute live segment: **A → B → C → D**, plus **E** if there's time.
 
 ### Demo A: Layer 1 sandbox (path traversal)
 - **Prompt:**
@@ -113,6 +117,7 @@ The `notes` server is a stand-in for a third-party MCP server. Its tool is `note
 
 | Symptom | Fix |
 |---|---|
+| Claude says the files don't exist / "Ran N commands" in `/home/claude` | It used its own sandbox, not the proxy. Do pre-flight step 6, then prefix the prompt with "Using the mcp-protected-proxy tools, …" |
 | Claude refuses to follow the injected instruction | Good model behavior. Say the proxy doesn't rely on it, and run the matching `python scripts/demo.py D<n>` |
 | A write or fetch is blocked when it shouldn't be | The connection still carries labels from an earlier demo. Toggle the server off and on, and start a new chat |
 | Claude uses the unprotected server | Only `mcp-protected-proxy` should be on in Settings → Developer |
