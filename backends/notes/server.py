@@ -27,7 +27,7 @@ from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 MODES = ("clean", "poisoned", "rugpull")
 
@@ -142,7 +142,7 @@ async def mcp(request: Request) -> JSONResponse:
             return _result(rid, {"content": [{"type": "text", "text": "\n".join(texts) or "(no notes)"}]})
         return JSONResponse({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": f"Unknown tool {name}"}})
     if method and method.startswith("notifications/"):
-        return JSONResponse({}, status_code=202)
+        return Response(status_code=202)  # no body: nothing to relay to the client
     return JSONResponse({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": f"Unknown method {method}"}})
 
 
