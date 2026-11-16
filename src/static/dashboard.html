@@ -167,7 +167,7 @@
     <div class="side">
       <section class="card panel">
         <h2>Session</h2>
-        <select id="picker" aria-label="Session"><option value="">Follow latest session</option></select>
+        <select id="picker" aria-label="Session"><option value="">Follow most recent activity</option></select>
         <div class="labels" id="labels"></div>
         <div id="origins"></div>
         <div class="sub-h">Path through the state machine</div>
@@ -271,7 +271,7 @@ function renderHero(item) {
 
 function renderPicker(sessions, current) {
   const sel = $("picker");
-  const opts = ['<option value="">Follow latest session</option>'].concat(sessions.map((s) => {
+  const opts = ['<option value="">Follow most recent activity</option>'].concat(sessions.map((s) => {
     const labels = (s.labels || []).length ? "  [" + s.labels.join(", ") + "]" : "";
     return `<option value="${esc(s.session_id)}">${esc(s.session_id)} · ${esc(s.client_name || "client")}${esc(labels)}</option>`;
   }));
@@ -334,7 +334,10 @@ async function tick() {
     const all = await Promise.all(sessions.map((s) =>
       getJSON(`/session/${encodeURIComponent(s.session_id)}/events`).catch(() => ({ events: [] }))));
     let allow = 0, block = 0, latest = null;
+    const lastActive = {};   // session id -> timestamp of its most recent event
     all.forEach((r, i) => {
+      const evs = r.events || [];
+      if (evs.length) lastActive[sessions[i].session_id] = evs[evs.length - 1].timestamp;
       for (const it of itemsFor(r.events)) {
         if (it.kind === "ALLOW") allow++;
         if (it.kind === "BLOCK") block++;
@@ -345,7 +348,9 @@ async function tick() {
     $("k-block").textContent = block;
     renderHero(latest);
 
-    const current = pinned || (sessions[0] && sessions[0].session_id) || "";
+    // "Follow latest" = the session that most recently did something (not the newest connection)
+    const active = Object.entries(lastActive).sort((a, b) => (a[1] < b[1] ? 1 : -1));
+    const current = pinned || (active[0] && active[0][0]) || (sessions[0] && sessions[0].session_id) || "";
     if (current) {
       const idx = sessions.findIndex((s) => s.session_id === current);
       const events = idx >= 0 ? all[idx].events : [];
