@@ -114,8 +114,12 @@ if ($Phase4) {
     git rev-parse -q --verify refs/tags/phase4-frozen | Out-Null
     if ($LASTEXITCODE -eq 0) {
         Compose-Down "mcp-netproxy" $Root "compose/eval.yml"
+        # Unpack the tagged code into the temp folder (no git worktree: nothing
+        # is written under .git, which OneDrive / antivirus can lock on Windows)
         $Wt = Join-Path $Out "phase4-src"
-        git worktree add -q --detach $Wt phase4-frozen
+        $Zip = Join-Path $Out "phase4-src.zip"
+        git archive --format=zip -o $Zip phase4-frozen
+        Expand-Archive -Path $Zip -DestinationPath $Wt -Force
         # Swap in today's pinned backend builds (the tag ran `npx -y` / unpinned pip)
         Copy-Item backends/filesystem/Dockerfile, backends/filesystem/requirements.txt, backends/filesystem/server.py "$Wt/mcp-filesystem-backend/" -Force
         Copy-Item backends/fetch/Dockerfile, backends/fetch/requirements.txt "$Wt/mcp-fetch-backend/" -Force
@@ -134,7 +138,7 @@ if ($Phase4) {
         if ($rowsOk -and $headOk) { Record "PASS" "Phase 4 frozen: 27/28 attacks blocked (96.4%), 0/26 false positives (eval/runs/final)" }
         else { Record "FAIL" "Phase 4 frozen: see $Out/phase4-all" }
         Compose-Down "mcp-netproxy-phase4" $Wt "tests/eval/docker-compose.eval.yml"
-        git worktree remove --force $Wt
+        Remove-Item -Recurse -Force $Wt, $Zip -ErrorAction SilentlyContinue
         Compose-Up "mcp-netproxy" $Root "compose/eval.yml" | Out-Null
     } else {
         Record "FAIL" "Phase 4 frozen: tag phase4-frozen not found (git fetch --tags)"

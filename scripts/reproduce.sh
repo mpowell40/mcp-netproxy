@@ -115,8 +115,9 @@ if [ "$PHASE4" = 1 ]; then
   fi
   if git rev-parse -q --verify "refs/tags/phase4-frozen" >/dev/null; then
     compose_down mcp-netproxy "$ROOT" compose/eval.yml
+    # Unpack the tagged code (no git worktree, so nothing is written under .git)
     WT="$OUT/phase4-src"
-    git worktree add -q --detach "$WT" phase4-frozen
+    mkdir -p "$WT" && git archive phase4-frozen | tar -x -C "$WT"
     # The tag's backend images ran `npx -y` / unpinned pip at build and start
     # time. Swap in today's pinned backend builds (same wrappers, pinned server
     # versions) so the rebuilt testbed is the one the results were measured on.
@@ -137,7 +138,7 @@ if [ "$PHASE4" = 1 ]; then
       record FAIL "Phase 4 frozen: see $OUT/phase4-all"
     fi
     compose_down mcp-netproxy-phase4 "$WT" tests/eval/docker-compose.eval.yml
-    git worktree remove --force "$WT"
+    rm -rf "$WT"
     compose_up mcp-netproxy "$ROOT" compose/eval.yml
   else
     record FAIL "Phase 4 frozen: tag phase4-frozen not found (git fetch --tags)"
