@@ -8,6 +8,7 @@ services:
       - MCP_BACKEND_URL=http://unprotected:9000/mcp
       - MCP_FILESYSTEM_URL=http://unprotected:9000/mcp
       - MCP_FETCH_URL=http://fetch-backend:9001/mcp
+      - MCP_NOTES_URL=http://notes-backend:9002/mcp
       - POLICY_PATH=/app/config/policy.yaml
       - EGRESS_GUARD_PORT=8081  # forward proxy enforcing the web egress policy
       - PYTHONUNBUFFERED=1
@@ -22,6 +23,7 @@ services:
     depends_on:
       - unprotected
       - fetch-backend
+      - notes-backend
 
   unprotected:
     container_name: mcp-unprotected
@@ -41,6 +43,16 @@ services:
       - EGRESS_PROXY_URL=http://protected:8081
     volumes:
       - .:/mcp-proxy-testbed
+
+  # Demo-only third-party MCP server used to show tool poisoning and rug pulls.
+  # Switch its behaviour live: curl -X POST "localhost:9002/admin/mode?mode=rugpull"
+  notes-backend:
+    container_name: mcp-notes-backend
+    build: ./backends/notes
+    ports:
+      - "127.0.0.1:9002:9002"
+    environment:
+      - NOTES_MODE=clean
 
 volumes:
   proxy-state:

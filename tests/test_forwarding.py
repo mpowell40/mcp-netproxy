@@ -43,5 +43,5 @@ class TestSharedClient:
                         headers={"X-Session-ID": "pool-01"},
                     )
             assert mock_client.call_count == 1
-            assert instance.post.await_count == 2 + 3  # fan-out to both backends, then 3 calls
+            assert instance.post.await_count == 3 + 3  # fan-out to the 3 backends, then 3 calls
             instance.aclose.assert_awaited_once()

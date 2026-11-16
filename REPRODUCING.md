@@ -19,6 +19,7 @@ Expected output:
 ```text
 PASS   pytest: unit + integration tests
 PASS   Phase 5 dev: 21/22 attacks blocked, 3/21 false positives (eval/runs/phase5-dev)
+PASS   Tool poisoning: 4/4 attacks blocked, 0/3 false positives (eval/runs/tools)
 PASS   Phase 4 frozen: 27/28 attacks blocked (96.4%), 0/26 false positives (eval/runs/final)
 ```
 
@@ -35,10 +36,11 @@ You can also run it on a clean GitHub runner: **Actions → reproduce → Run wo
 |---|---|---|---|---|
 | Phase 4: 27/28 attacks blocked (96.4%), 0/26 FP; dev 21/22, holdout 6/6 | tag `phase4-frozen` (`8c566d3`) | `reproduce.sh --phase4` | `eval/runs/final/` | Dev rows per scenario; holdout via `summary.md` headline (holdout rows are not committed) |
 | Phase 5: dev 21/22 blocked, 3/21 FP (H06, H07, H12) | current `config/policy.yaml` (tag `phase5-eval` = `1189528`) | `reproduce.sh` | `eval/runs/phase5-dev/` | Per scenario |
+| Tool poisoning / rug pull: 4/4 blocked, 0/3 FP; without the proxy the canary is exfiltrated in 4/4 | current code, `manifest:` in `config/policy.yaml` | `reproduce.sh` (`eval/run_tool_eval.py`) | `eval/runs/tools/` | Per scenario. Self-authored scenarios and demo server: shows the mechanism, not real-world coverage |
 | Phase 5 live: 8/8 blocked, 4/12 FP | `config/policy.phase5.live.yaml` | see below | `eval/runs/phase5-live/` | **Indicative**: depends on live websites |
 | Phase 4 live: 5/8 blocked, 0/12 FP | `config/policy.live.yaml` | see below | `eval/runs/live/` | **Indicative** |
 | Median added latency ~7 ms (p95 ~18 ms) | — | any eval run (`summary.md`) | `eval/runs/final/` | **Indicative**: measured on Docker Desktop for Windows, where `realpath` crosses the file-sharing layer. A Linux host measured ~3 ms. |
-| 282 unit and integration tests pass (280 + 2 skipped on Windows: symlink tests need POSIX) | current code | `python -m pytest tests/ -q` | — | `ci.yml` on every push |
+| 312 unit and integration tests pass (2 symlink tests are skipped on Windows: they need POSIX) | current code | `python -m pytest tests/ -q` | — | `ci.yml` on every push |
 
 ### Live-internet sets (not part of the one-command check)
 
@@ -73,4 +75,4 @@ docker compose build --build-arg FS_SERVER_VERSION=<version> unprotected
 
 - The Phase 4 holdout split was run **once**, on the frozen policy. Re-running it to reproduce is fine. Changing the policy in response to it is not.
 - Phase 5 was designed after seeing the Phase 4 results, so both of its sets are dev sets. A blind number needs `eval/scenarios_phase5_holdout/` (see its README).
-- The persistent file label store (`/app/state/file_labels.json`) must start empty. `reproduce.sh` clears it before the Phase 5 run.
+- The persistent file label store (`/app/state/file_labels.json`) and the manifest pin store (`/app/state/manifest_pins.json`) must start empty. `reproduce.sh` clears both before the Phase 5 run. Stale pins from another server version would withhold tools as drift.

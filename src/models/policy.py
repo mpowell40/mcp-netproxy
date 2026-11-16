@@ -216,6 +216,26 @@ class BackendConfig(BaseModel):
     tools: dict[str, ToolState] = Field(default_factory=dict)
 
 
+class ManifestConfig(BaseModel):
+    """Tool manifest pinning and tool-poisoning detection on ``tools/list``.
+
+    Attributes:
+        enabled: Check every advertised tool (default on).
+        mode: ``block`` hides quarantined tools from ``tools/list`` and
+            refuses calls to them; ``warn`` only records alerts.
+        store_path: JSON file of pinned tool fingerprints, persisted across
+            restarts (``MCP_MANIFEST_STORE`` overrides it); ``None`` keeps
+            pins in memory only.
+        scan_descriptions: Check tool and parameter descriptions for
+            tool-poisoning patterns.
+    """
+
+    enabled: bool = True
+    mode: Literal["block", "warn"] = "block"
+    store_path: str | None = None
+    scan_descriptions: bool = True
+
+
 class PolicyConfig(BaseModel):
     """Root policy configuration loaded from YAML.
 
@@ -241,6 +261,7 @@ class PolicyConfig(BaseModel):
     default_backend: str | None = None
     argument_limits: ArgumentLimits = Field(default_factory=ArgumentLimits)
     labels: LabelPolicy = Field(default_factory=LabelPolicy)
+    manifest: ManifestConfig = Field(default_factory=ManifestConfig)
 
     # Names declared at the top level of ``tool_mappings``; never replaced
     # or withdrawn by backend aliasing.

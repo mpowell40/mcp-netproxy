@@ -8,6 +8,7 @@
 
 - **Phase 4** added fetch, the egress guard and the evaluation harness. It was evaluated on a 54-scenario labeled set (**96.4% block rate, 0% false positives**, tag `phase4-frozen`).
 - **Phase 5** replaced content-based taint with **provenance labels**. A session is labeled by *where* its data came from, not by what the text says. Phase 5 also added value tracking, persistent file labels and proxy-issued session tokens. It blocks every attack in the 20-scenario live-internet set (8/8, up from 5/8). The cost is more false positives on fetch-then-write workflows.
+- **Phase 6 (final)** adds **tool poisoning and rug-pull defense**. Every tool a server advertises is scanned for hidden instructions and pinned by fingerprint. A tool whose description is poisoned, or that changes after it was pinned, is withheld from the agent and calls to it are refused (4/4 attacks blocked, 0/3 false positives on `eval/runs/tools/`).
 
 See [Evaluation Results](#evaluation-results). To regenerate every reported number from a clean clone, see [REPRODUCING.md](REPRODUCING.md) (`scripts/reproduce.sh --phase4`).
 
@@ -114,6 +115,23 @@ Backends are declared in `config/policy.yaml` under `backends:`. Every tool a ba
 ### Egress guard
 The fetch backend sends all outbound traffic through a forward proxy built into `mcp-netproxy` (`EGRESS_GUARD_PORT=8081`). The guard re-applies the same egress policy to every request, including redirects the backend follows by itself, and connects to the exact address it validated, so DNS rebinding can't slip past it. Refusals are logged as `[EGRESS GUARD BLOCKED]`.
 
+### Tool manifest pinning (tool poisoning and rug pulls)
+A server's tool descriptions go straight into the model's context, so a malicious or compromised server can attack the agent before any tool is called. On every `tools/list`, each advertised tool is checked before the agent sees it (`src/engine/manifest.py`, `manifest:` in `config/policy.yaml`):
+- **Description scan:** the tool and parameter descriptions are checked against tool-poisoning patterns: hidden `<IMPORTANT>`-style tags, "don't tell the user", "ignore previous instructions", references to credential files (`~/.ssh`, `.env`, `secrets/`), side tasks "before using this tool", and invisible Unicode. None of the real filesystem or fetch tool descriptions match.
+- **Pinning:** a SHA-256 fingerprint of each tool's name, description and input schema is pinned the first time the proxy sees it (`/app/state/manifest_pins.json`). Any later change is **drift**, a "rug pull". This catches malicious changes the patterns can't recognize.
+- **Enforcement:** a poisoned or drifted tool is **withheld from `tools/list`**, so the model never reads the malicious description. Calls to it are refused with `-32602` (`error.data.check = "manifest"`), and the proxy logs `[SECURITY BLOCKED - MANIFEST]`. Quarantine is sticky: a server that changes a tool back is still quarantined. A new tool on an already-pinned backend is pinned with an alert.
+- `mode: warn` records alerts without blocking. `GET /manifest` shows pins, quarantined tools and alerts.
+- After an intended server upgrade, re-approve the backend, then restart the proxy:
+  ```powershell
+  docker exec mcp-protected python -m src.engine.manifest approve <backend>
+  ```
+
+The demo backend `backends/notes/` (`notes__add_note`, port 9002) can be switched live between `clean`, `poisoned` and `rugpull`:
+```powershell
+curl.exe -s -X POST "http://localhost:9002/admin/mode?mode=rugpull&rugpull_after=0"
+```
+`GET http://localhost:9002/admin/notes` shows what it received, which is what an attacker would have collected.
+
 ---
 
 ## Project Structure
@@ -129,6 +147,7 @@ mcp-proxy-testbed/
 │   │   ├── classifier.py           #   schema heuristics for discovered tools
 │   │   ├── state_machine.py        #   L2 DFA, label sink checks, invariants, session TTL
 │   │   ├── labels.py               #   provenance labels, value tracking, persistent file labels
+│   │   ├── manifest.py             #   tool manifest pinning + tool-poisoning scan (tools/list)
 │   │   ├── session_tokens.py       #   proxy-issued Mcp-Session-Id tokens
 │   │   ├── paths.py                #   shared path canonicalization (sandbox + label globs)
 │   │   ├── ingest_scanner.py       #   regex scanner for injection directives (alerts only)
@@ -140,8 +159,9 @@ mcp-proxy-testbed/
 │   └── policy.live.yaml            # Phase 4 policy + live-internet allowlist (kept for eval/runs/live)
 ├── backends/                       # MCP servers behind the proxy (HTTP wrappers over stdio)
 │   ├── filesystem/                 #   @modelcontextprotocol/server-filesystem  (:9000)
-│   └── fetch/                      #   mcp-server-fetch                         (:9001)
-│       └── fixtures/               #   HTML pages served at /fixtures/<name>
+│   ├── fetch/                      #   mcp-server-fetch                         (:9001)
+│   │   └── fixtures/               #   HTML pages served at /fixtures/<name>
+│   └── notes/                      #   demo third-party server: clean / poisoned / rugpull (:9002)
 ├── compose/
 │   ├── eval.yml                    #   overlay: adds the eval-only redirect service
 │   ├── live.yml                    #   overlay: switches proxy to policy.live.yaml (Phase 4)
@@ -321,6 +341,7 @@ The bridge stores the proxy-issued session token, so each Claude Desktop connect
 | Endpoint | Returns |
 | --- | --- |
 | `GET /sessions` | Live sessions with their labels |
+| `GET /manifest` | Pinned tool fingerprints, quarantined tools and manifest alerts |
 | `GET /session/{id}` | State history, current state, labels with their origins, scanner alerts |
 | `GET /session/{id}/events` | Checkpoint telemetry (`BEFORE/AFTER_TOOL_LIST`, `BEFORE/AFTER_TOOL_CALL`) with decision and layer |
 | `GET /session/{id}/graph` | Mermaid state diagram of the session's trajectory |
@@ -368,6 +389,17 @@ The Phase 5 runs are `eval/runs/phase5-dev/` and `eval/runs/phase5-live/`, at co
 - **The new false positives are the expected cost of deciding by provenance.** They are H06, H07, H12, LB08, LB10, LB11 and LB12. Each one is a fetch followed by a write, or (H12) a second fetch. They were reported, not tuned away.
 - **A21 (`chain_recon`) is still missed in both phases.**
 - Phase 5 was designed knowing the Phase 4 results, so both sets are dev sets for it. The blind number will come from `eval/scenarios_phase5_holdout/`. Details are in [eval/README.md](eval/README.md#phase-5-provenance-labels).
+
+### Phase 6: tool poisoning and rug pulls
+
+`eval/run_tool_eval.py` stages each scenario on the demo `notes` server, switching what it advertises between `tools/list` calls, and replays the same steps directly against the server as the unprotected baseline. Results are in `eval/runs/tools/`.
+
+| | Proxy | Unprotected |
+| --- | --- | --- |
+| Attacks (poisoned at first sight; three rug pulls, including one that evades every pattern and one that reverts) | **4/4 blocked**: tool withheld, canary never reaches the server | 4/4: malicious description shown, canary exfiltrated |
+| Benign (honest server, repeated listing, real fs/fetch tools) | **0/3 false positives** | — |
+
+These are self-authored scenarios against a self-authored server. They show that the mechanism works, not how it fares against unseen real-world poisoning. The Phase 4 and Phase 5 sets reproduce unchanged with the manifest check enabled.
 
 ---
 

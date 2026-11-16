@@ -18,6 +18,8 @@ It answers three questions on every tool call:
 | **Where did the data come from?** Has this session touched untrusted or secret data? | Layer 2: provenance labels + sink rules, value tracking | `src/engine/labels.py`, `state_machine.py`, `labels:` in `config/policy.yaml` | `-32001` |
 | **Is this sequence allowed?** | Layer 2: DFA transition graph + forbidden invariants | `state_machine.py`, `allowed_transitions` | `-32001` |
 
+A fourth check runs before the agent even sees the tools: **manifest pinning** (`src/engine/manifest.py`). Every advertised tool is scanned for poisoned descriptions and pinned by fingerprint. A poisoned or changed ("rug pull") tool is withheld from `tools/list` and calls to it are refused.
+
 Three supporting pieces:
 - the **egress guard**, which re-checks every network request the fetch backend makes
 - **proxy-issued session tokens**
@@ -33,6 +35,7 @@ Three supporting pieces:
 | 3 | DFA + regex ingest scanner + sticky taint (Layer 2) | Prompt injection carried in files | Demo Test B, `15ae2c4` |
 | 4 | Fetch backend, namespaced registry, URL allowlist, egress guard, eval harness | SSRF, `file://`, redirect bounce, exfiltration to non-allowlisted hosts | `eval/runs/final/`: 96.4% blocked, 0% FP |
 | 5 | Provenance labels (`untrusted` / `secret`), value tracking, persistent file labels, session tokens | Exfiltration to *allowlisted* hosts (LA06–LA08), escaping taint by switching session ID | `eval/runs/phase5-*`: 8/8 live, FP cost |
+| 6 (final) | Tool manifest pinning + tool-description scan, `notes` demo server | Tool poisoning, rug pulls (attacks *before* any tool call) | `eval/runs/tools/`: 4/4, 0/3 FP |
 
 **The key shift between Phase 4 and Phase 5:**
 - **Phase 4 asked "what does the text say?"** A regex scanner read every response, and a match tainted the session. LA06 got through because the live page's wording didn't match.
@@ -147,7 +150,7 @@ Layer 1 only sees the URL the agent asked for. The fetch server then makes its o
 | Egress allowlist + guard that's safe against redirects and DNS rebinding | ✅ | ❌ |
 | Provenance / taint across calls | ✅ labels, sinks, file labels | Opt-in capability firewall |
 | Injection-text detection quality | Regex, alerts only | Strong (4 layers) |
-| Tool manifest pinning / poisoning scan | Planned (final build) | ✅ |
+| Tool manifest pinning / poisoning scan | ✅ (withholds the tool from the agent) | ✅ |
 | Install | Docker testbed | `npx … -- <server>` |
 
 **Novelty, stated honestly:**

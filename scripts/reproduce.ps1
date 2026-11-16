@@ -1,7 +1,7 @@
 # Reproduce the reported mcp-netproxy results from a clean clone (Windows / PowerShell).
 # Same checks as scripts/reproduce.sh; see REPRODUCING.md.
 #
-#   .\scripts\reproduce.ps1            unit tests + Phase 5 dev set (current code)
+#   .\scripts\reproduce.ps1            unit tests + Phase 5 dev set + tool-poisoning set (current code)
 #   .\scripts\reproduce.ps1 -Phase4    also rebuild tag phase4-frozen and re-run its dev + holdout set
 #
 #   -NoBuild     use images that are already built
@@ -45,7 +45,7 @@ function Wait-Proxy {
 # by hand with `docker compose up` belongs to a project named after the checkout
 # folder, so remove those testbed containers before starting ours.
 function Clear-Testbed {
-    foreach ($c in "mcp-protected", "mcp-unprotected", "mcp-fetch-backend", "mcp-eval-redirect") {
+    foreach ($c in "mcp-protected", "mcp-unprotected", "mcp-fetch-backend", "mcp-eval-redirect", "mcp-notes-backend") {
         docker rm -f $c 2>&1 | Out-Null
     }
 }
@@ -90,13 +90,21 @@ Write-Host "== Phase 5 dev set (config/policy.yaml)"
 Assert-Docker
 if (-not (Compose-Up "mcp-netproxy" $Root "compose/eval.yml")) { Record "FAIL" "Phase 5 dev: testbed did not start"; $Results | ForEach-Object { Write-Host $_ }; exit 1 }
 Wait-Proxy | Out-Null
-docker exec mcp-protected rm -f /app/state/file_labels.json | Out-Null
+# Empty file label and manifest pin stores, as the reported run did
+docker exec mcp-protected rm -f /app/state/file_labels.json /app/state/manifest_pins.json | Out-Null
 docker restart mcp-protected | Out-Null
 Wait-Proxy | Out-Null
 & $Python eval/run_eval.py --set dev --reps $Reps --out "$Out/phase5-dev" *> "$Out/phase5-dev.log"
 & $Python eval/compare_runs.py eval/runs/phase5-dev "$Out/phase5-dev"
 if ($LASTEXITCODE -eq 0) { Record "PASS" "Phase 5 dev: 21/22 attacks blocked, 3/21 false positives (eval/runs/phase5-dev)" }
 else { Record "FAIL" "Phase 5 dev: see $Out/phase5-dev" }
+
+# 2b. Tool poisoning / rug pull (manifest pinning) vs eval/runs/tools
+Write-Host "== Tool poisoning / rug pull set (notes backend)"
+& $Python eval/run_tool_eval.py --out "$Out/tools" *> "$Out/tools.log"
+& $Python eval/compare_runs.py eval/runs/tools "$Out/tools"
+if ($LASTEXITCODE -eq 0) { Record "PASS" "Tool poisoning: 4/4 attacks blocked, 0/3 false positives (eval/runs/tools)" }
+else { Record "FAIL" "Tool poisoning: see $Out/tools" }
 
 # 3. Phase 4 (tag phase4-frozen): dev + holdout vs eval/runs/final
 if ($Phase4) {

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Reproduce the reported mcp-netproxy results from a clean clone.
 #
-#   scripts/reproduce.sh            unit tests + Phase 5 dev set (current code)
+#   scripts/reproduce.sh            unit tests + Phase 5 dev set + tool-poisoning set (current code)
 #   scripts/reproduce.sh --phase4   also rebuild the Phase 4 policy from tag
 #                                   phase4-frozen and re-run its dev + holdout set
 #
@@ -56,7 +56,7 @@ wait_for_proxy() {
 # The compose files give containers fixed names (mcp-protected, ...).  A stack
 # started by hand with `docker compose up` belongs to a project named after the
 # checkout folder, so remove those testbed containers before starting ours.
-TESTBED_CONTAINERS=(mcp-protected mcp-unprotected mcp-fetch-backend mcp-eval-redirect)
+TESTBED_CONTAINERS=(mcp-protected mcp-unprotected mcp-fetch-backend mcp-eval-redirect mcp-notes-backend)
 clear_testbed() { docker rm -f "${TESTBED_CONTAINERS[@]}" >/dev/null 2>&1 || true; }
 
 compose_up() {  # $1 = project name, $2 = project dir, $3 = eval overlay (relative to it)
@@ -88,13 +88,23 @@ if ! compose_up mcp-netproxy "$ROOT" compose/eval.yml; then
   printf '%s\n' "${RESULTS[@]}"; exit 1
 fi
 wait_for_proxy
-# Start from an empty persistent file label store, as the reported run did
-docker exec mcp-protected rm -f /app/state/file_labels.json >/dev/null 2>&1 && docker restart mcp-protected >/dev/null && wait_for_proxy
+# Start from an empty persistent file label store and manifest pin store, as
+# the reported run did (stale pins from other server versions would withhold tools)
+docker exec mcp-protected rm -f /app/state/file_labels.json /app/state/manifest_pins.json >/dev/null 2>&1 && docker restart mcp-protected >/dev/null && wait_for_proxy
 "$PY" eval/run_eval.py --set dev --reps "$REPS" --out "$OUT/phase5-dev" >"$OUT/phase5-dev.log" 2>&1
 if "$PY" eval/compare_runs.py eval/runs/phase5-dev "$OUT/phase5-dev"; then
   record PASS "Phase 5 dev: 21/22 attacks blocked, 3/21 false positives (eval/runs/phase5-dev)"
 else
   record FAIL "Phase 5 dev: see $OUT/phase5-dev"
+fi
+
+# 2b. Tool poisoning / rug pull (manifest pinning) vs eval/runs/tools --------
+echo "== Tool poisoning / rug pull set (notes backend)"
+"$PY" eval/run_tool_eval.py --out "$OUT/tools" >"$OUT/tools.log" 2>&1
+if "$PY" eval/compare_runs.py eval/runs/tools "$OUT/tools"; then
+  record PASS "Tool poisoning: 4/4 attacks blocked, 0/3 false positives (eval/runs/tools)"
+else
+  record FAIL "Tool poisoning: see $OUT/tools"
 fi
 
 # 3. Phase 4 (tag phase4-frozen): dev + holdout vs eval/runs/final ---------

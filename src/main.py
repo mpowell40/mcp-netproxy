@@ -40,10 +40,11 @@ from fastapi import FastAPI, Request, Response
 from src.engine.egress import EgressGuard
 from src.engine.events import Checkpoint, Decision, EventCollector, ProxyEvent
 from src.engine.ingest_scanner import scan_payload_for_untrusted_directives
+from src.engine.manifest import ManifestPinStore
 from src.engine.registry import BackendRegistry, ToolResolutionError
 from src.engine.session_tokens import PUBLIC_ID_HEADER, SESSION_HEADER, SessionTokenStore
 from src.engine.state_machine import DEFAULT_SESSION_TTL, SessionGraphManager, describe_source
-from src.models.policy import PolicyConfig, ToolState
+from src.models.policy import PolicyConfig, ToolState, namespaced
 
 # ---------------------------------------------------------------------------
 # Logging Setup
@@ -74,6 +75,8 @@ AWS_KEY_PATTERN = r"(AKIA[0-9A-Z]{16})"
 
 # Namespace that ``fetch_downstream_url`` overrides (legacy create_app kwarg)
 _FETCH_NAMESPACE = "web"
+# Overrides manifest.store_path (tests, alternate deployments)
+MANIFEST_STORE_ENV = "MCP_MANIFEST_STORE"
 
 
 def create_app(
@@ -156,11 +159,21 @@ def create_app(
         url_overrides.setdefault(_FETCH_NAMESPACE, fetch_downstream_url)
     _registry = BackendRegistry(_policy, url_overrides)
 
+    # Tool manifest pinning + tool-poisoning detection on tools/list
+    _manifest: ManifestPinStore | None = None
+    if _policy.manifest.enabled:
+        _manifest = ManifestPinStore(
+            os.getenv(MANIFEST_STORE_ENV) or _policy.manifest.store_path,
+            mode=_policy.manifest.mode,
+            scan_descriptions=_policy.manifest.scan_descriptions,
+        )
+
     # Store on app.state for access in tests / introspection
     app.state.http_client = None  # set for the app's lifetime by lifespan
     app.state.policy = _policy
     app.state.engine = _engine
     app.state.registry = _registry
+    app.state.manifest = _manifest
     app.state.events = _events
     app.state.session_mode = _session_mode
     app.state.session_tokens = _tokens
@@ -227,7 +240,9 @@ def create_app(
         # -- tools/list: multiplex across backends & auto-classify ---------
         if method == "tools/list":
             _emit(Checkpoint.BEFORE_TOOL_LIST, session_id, None, Decision.ALLOW, request_id)
-            return await _handle_tools_list(payload, _registry, session_id, _emit, app.state.http_client)
+            return await _handle_tools_list(
+                payload, _registry, session_id, _emit, app.state.http_client, manifest=_manifest
+            )
 
         # -- Non-tool-call requests pass through to the default backend ----
         if method != "tools/call":
@@ -297,6 +312,13 @@ def create_app(
     # -----------------------------------------------------------------------
     # GET /sessions  –  live sessions (public ids only)
     # -----------------------------------------------------------------------
+    @app.get("/manifest")
+    async def manifest_state() -> dict:
+        """Pinned tool fingerprints, quarantined tools and manifest alerts."""
+        if _manifest is None:
+            return {"enabled": False}
+        return {"enabled": True, **_manifest.snapshot()}
+
     @app.get("/sessions")
     async def list_sessions() -> dict:
         """List live token sessions with their taint status."""
@@ -330,6 +352,22 @@ def create_app(
             )
             block("routing", str(exc))
             return _jsonrpc_error(request_id, -32602, str(exc), data=exc.data, status=200)
+
+        # -- Manifest: tools quarantined for poisoning or drift (rug pull) ---
+        manifest_reason = _manifest.blocked_reason(resolved.canonical) if _manifest else None
+        if manifest_reason is not None:
+            logger.warning(
+                f"[SECURITY BLOCKED - MANIFEST] Session '{session_id}' called quarantined tool "
+                f"'{resolved.canonical}': {manifest_reason}"
+            )
+            block("manifest", manifest_reason, resolved.canonical)
+            return _jsonrpc_error(
+                request_id,
+                -32602,
+                f"Policy Violation: {manifest_reason} blocked by proxy",
+                data={"check": "manifest", "tool": resolved.canonical},
+                status=200,
+            )
 
         # -- Layer 1: Argument validation (types and size limits) -----------
         argument_violation = _registry.find_argument_violation(resolved, arguments)
@@ -655,8 +693,14 @@ async def _handle_tools_list(
     session_id: str,
     emit: Callable[..., None],
     shared: httpx.AsyncClient | None = None,
+    manifest: ManifestPinStore | None = None,
 ) -> Response:
     """Multiplex ``tools/list`` across all registered backends and auto-classify.
+
+    With a ``manifest`` store, every advertised tool is first checked for
+    tool poisoning and against its pinned fingerprint; in block mode a
+    poisoned or drifted tool is left out of the list (calls to it are
+    refused in ``_handle_tool_call``).
 
     Queries every backend concurrently, namespaces each advertised tool as
     ``<namespace>__<tool>`` so identical upstream names never collide, and
@@ -668,6 +712,7 @@ async def _handle_tools_list(
     merged_tools: list[dict[str, Any]] = []
     seen_names: set[str] = set()
     any_success = False
+    any_tools = False  # a backend advertised at least one tool (even if all were withheld)
     last_error: Exception | None = None
     raw_fallback_response: httpx.Response | None = None
 
@@ -693,6 +738,31 @@ async def _handle_tools_list(
         for tool in tools:
             if not isinstance(tool, dict) or not tool.get("name"):
                 continue
+            any_tools = True
+            if manifest is not None:
+                key = namespaced(namespace, str(tool["name"]))
+                verdict = manifest.check(namespace, tool, key)
+                if verdict.is_violation:
+                    withheld = manifest.mode == "block"
+                    logger.warning(
+                        f"[SECURITY {'BLOCKED' if withheld else 'ALERT'} - MANIFEST] "
+                        f"{'Withheld' if withheld else 'Flagged'} '{key}' from tools/list: {verdict.reason}"
+                    )
+                    emit(
+                        Checkpoint.AFTER_TOOL_LIST,
+                        session_id,
+                        key,
+                        Decision.BLOCK if withheld else Decision.ALLOW,
+                        payload.get("id"),
+                        backend=namespace,
+                        upstream_tool=tool["name"],
+                        layer="manifest",
+                        manifest_status=verdict.status,
+                        reason=verdict.reason,
+                        description=str(tool.get("description", ""))[:200],
+                    )
+                    if withheld:
+                        continue
             namespaced_tool = registry.register_discovered(namespace, tool)
             if namespaced_tool["name"] not in seen_names:
                 seen_names.add(namespaced_tool["name"])
@@ -721,7 +791,7 @@ async def _handle_tools_list(
             status=502,
         )
 
-    if not merged_tools and raw_fallback_response is not None:
+    if not merged_tools and not any_tools and raw_fallback_response is not None:
         return Response(
             content=raw_fallback_response.content,
             status_code=raw_fallback_response.status_code,

@@ -74,6 +74,16 @@ backends:
       # session untrusted (labels.sources.untrusted.tools), whatever it says.
       fetch: NETWORK_EGRESS
 
+  notes:  # backends/notes: demo third-party server (tool poisoning / rug pull)
+    url: http://notes-backend:9002/mcp
+    url_env: MCP_NOTES_URL
+    # Notes leave the machine for a third-party service, so saving one is egress.
+    capabilities: [DISCOVERY, LOCAL_READ, NETWORK_EGRESS]
+    scan_responses: false
+    tools:
+      add_note: NETWORK_EGRESS
+      list_notes: LOCAL_READ
+
 # ----------------------------------------------------------------------------
 # Global tool mappings
 # ----------------------------------------------------------------------------
@@ -181,6 +191,26 @@ labels:
 # Arguments must be an object; path/URL arguments must be strings (or lists
 # of strings); values must match the tool's inputSchema types once the proxy
 # has seen it via tools/list.
+# ----------------------------------------------------------------------------
+# Tool manifest pinning and tool-poisoning detection (tools/list)
+# ----------------------------------------------------------------------------
+# Every advertised tool is checked before the agent sees it:
+#   - its description and parameter descriptions are scanned for
+#     tool-poisoning patterns (hidden <IMPORTANT> tags, "don't tell the
+#     user", credential file references, invisible Unicode, ...);
+#   - its fingerprint (sha256 of name, description, inputSchema) is pinned on
+#     first sight; any later change is drift (a "rug pull").
+# mode: block withholds poisoned / drifted tools from tools/list and refuses
+# calls to them (-32602, check=manifest); warn only records alerts.
+# Pins persist in store_path; after an intended server upgrade run
+#   docker exec mcp-protected python -m src.engine.manifest approve <backend>
+# and restart the proxy.  GET /manifest shows pins, quarantine and alerts.
+manifest:
+  enabled: true
+  mode: block
+  store_path: /app/state/manifest_pins.json   # proxy-state volume
+  scan_descriptions: true
+
 argument_limits:
   max_path_length: 4096       # PATH_MAX
   max_url_length: 8192
