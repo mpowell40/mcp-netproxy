@@ -1,0 +1,3 @@
+# Host-side: unit tests, eval harness, Claude Desktop bridge
+-r requirements.txt
+pytest==9.2.0

@@ -9,7 +9,7 @@
 - **Phase 4** added fetch, the egress guard and the evaluation harness. It was evaluated on a 54-scenario labeled set (**96.4% block rate, 0% false positives**, tag `phase4-frozen`).
 - **Phase 5** replaced content-based taint with **provenance labels**. A session is labeled by *where* its data came from, not by what the text says. Phase 5 also added value tracking, persistent file labels and proxy-issued session tokens. It blocks every attack in the 20-scenario live-internet set (8/8, up from 5/8). The cost is more false positives on fetch-then-write workflows.
 
-See [Evaluation Results](#evaluation-results).
+See [Evaluation Results](#evaluation-results). To regenerate every reported number from a clean clone, see [REPRODUCING.md](REPRODUCING.md) (`scripts/reproduce.sh --phase4`).
 
 ---
 
@@ -160,6 +160,10 @@ mcp-proxy-testbed/
 ├── tests/                          # pytest unit + integration tests (no Docker needed)
 ├── scripts/claude_stdio_bridge.py  # Stdio → HTTP bridge so Claude Desktop can use the proxy
 ├── service_catalog.json            # Fake "sensitive" file outside sandbox/ (traversal target)
+├── scripts/reproduce.sh, .ps1      # Clean clone -> reported results, checked per scenario
+├── eval/compare_runs.py            # Compares a fresh run with a committed one
+├── requirements.txt, -dev.txt      # Pinned proxy / host dependencies
+├── REPRODUCING.md                  # Claims table: number -> tag -> command -> committed run
 ├── Dockerfile                      # Proxy image
 └── docker-compose.yml              # Proxy + both backends
 ```
@@ -178,7 +182,7 @@ mcp-proxy-testbed/
 ### 1. Install host dependencies
 
 ```powershell
-pip install fastapi uvicorn httpx pydantic pyyaml pytest
+pip install -r requirements-dev.txt
 ```
 
 ### 2. Run the test suite (no Docker required)

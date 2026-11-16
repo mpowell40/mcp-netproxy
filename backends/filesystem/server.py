@@ -18,7 +18,9 @@ async def startup():
     print(f"Starting official MCP filesystem server rooted at: {ROOT_DIR}...", flush=True)
 
     proc = await asyncio.create_subprocess_exec(
-        "npx", "-y", "@modelcontextprotocol/server-filesystem", ROOT_DIR,
+        # Installed at image build time at a pinned version (see Dockerfile);
+        # never `npx -y`, which would fetch whatever is latest at startup.
+        "mcp-server-filesystem", ROOT_DIR,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE

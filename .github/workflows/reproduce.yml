@@ -1,0 +1,27 @@
+# Rebuilds the Docker testbed on a clean runner and checks the committed
+# evaluation results scenario by scenario (scripts/reproduce.sh).
+# Run it from the Actions tab: "reproduce" -> "Run workflow".
+name: reproduce
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase4:
+        description: "Also rebuild tag phase4-frozen and re-run its dev + holdout set"
+        type: boolean
+        default: true
+
+jobs:
+  reproduce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # tags (phase4-frozen) and history for the worktree
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements-dev.txt
+      - name: Reproduce reported results
+        run: scripts/reproduce.sh ${{ inputs.phase4 && '--phase4' || '' }}

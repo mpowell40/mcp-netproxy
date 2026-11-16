@@ -1,9 +1,10 @@
-FROM python:3.11-slim
+FROM python:3.11-slim-bookworm
 
 WORKDIR /app
 
-# Install dependencies
-RUN pip install --no-cache-dir fastapi uvicorn httpx pydantic pyyaml
+# Pinned dependencies (requirements.txt) so a fresh clone builds the same proxy
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code and config
 COPY src/ ./src/
