@@ -53,7 +53,14 @@ wait_for_proxy() {
 # Each phase gets its own Compose project, so its images (<project>-protected,
 # ...) never stand in for the other phase's.  Container names are fixed in the
 # compose files, so only one phase runs at a time.
+# The compose files give containers fixed names (mcp-protected, ...).  A stack
+# started by hand with `docker compose up` belongs to a project named after the
+# checkout folder, so remove those testbed containers before starting ours.
+TESTBED_CONTAINERS=(mcp-protected mcp-unprotected mcp-fetch-backend mcp-eval-redirect)
+clear_testbed() { docker rm -f "${TESTBED_CONTAINERS[@]}" >/dev/null 2>&1 || true; }
+
 compose_up() {  # $1 = project name, $2 = project dir, $3 = eval overlay (relative to it)
+  clear_testbed
   local proj=$1 dir=$2 overlay=$3 flags=(-d)
   [ "$BUILD" = 1 ] && flags+=(--build) || flags+=(--no-build)
   (cd "$dir" && docker compose -p "$proj" -f docker-compose.yml -f "$overlay" up "${flags[@]}") >/dev/null

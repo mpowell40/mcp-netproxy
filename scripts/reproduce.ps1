@@ -41,7 +41,17 @@ function Wait-Proxy {
 }
 
 # Each phase gets its own Compose project so their images never mix.
+# The compose files give containers fixed names (mcp-protected, ...). A stack started
+# by hand with `docker compose up` belongs to a project named after the checkout
+# folder, so remove those testbed containers before starting ours.
+function Clear-Testbed {
+    foreach ($c in "mcp-protected", "mcp-unprotected", "mcp-fetch-backend", "mcp-eval-redirect") {
+        docker rm -f $c 2>&1 | Out-Null
+    }
+}
+
 function Compose-Up($project, $dir, $overlay) {
+    Clear-Testbed
     $flag = if ($NoBuild) { "--no-build" } else { "--build" }
     Push-Location $dir
     docker compose -p $project -f docker-compose.yml -f $overlay up -d $flag
