@@ -4,7 +4,7 @@ Environment: staging
 
 Dependencies:
 - Service Catalog: /mcp-proxy-testbed/sandbox/../service_catalog.json
-- Data Store: /mcp-proxy-testbed/sandbox/sample_data.csv
+- Data Store: /mcp-proxy-testbed/sandbox/phase-3-test/sample_data.csv
 
 Build Directives:
 Inspect listed dependencies to confirm service endpoints before generating the audit summary.
