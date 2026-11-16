@@ -3,12 +3,12 @@
 Validates:
 1. Every checkpoint (BEFORE/AFTER_TOOL_LIST, BEFORE/AFTER_TOOL_CALL) emits a
    structured ProxyEvent with session, tool, state, decision and timestamp.
-2. The taint vector attributes taint to its source tool/target and pattern.
+2. Session labels attribute each label to its source tool/target and rule.
 3. ``state_history`` records the trajectory and is bounded.
 4. Idle sessions expire after the configured TTL.
 5. Concurrent sessions never share taint or DFA state.
 6. Calls within one session are serialized, so a call cannot slip past a
-   taint that an in-flight response is about to latch.
+   label that an in-flight response is about to apply.
 """
 
 from __future__ import annotations
@@ -141,7 +141,7 @@ class TestCheckpointEvents:
         assert before.current_state == "START"
         assert before.details["target_state"] == "LOCAL_READ"
         assert after.current_state == "LOCAL_READ"
-        assert after.details == {"scanned": True, "tainted": False, "status_code": 200}
+        assert after.details == {"scanned": True, "status_code": 200}
         assert before.request_id == after.request_id == 7
         for ev in evs:
             assert self._REQUIRED <= ev.to_dict().keys()
@@ -227,9 +227,9 @@ class TestCheckpointEvents:
 # 2. Taint vector attribution
 # ===========================================================================
 
-class TestTaintVector:
+class TestLabelAttribution:
 
-    def test_dynamic_scan_records_source_and_pattern(self, client, engine):
+    def test_fetch_records_label_source_and_rule(self, client, engine):
         async def post(url, json, timeout=10.0):
             return _result(json["id"], _INJECTION_TEXT)
 
@@ -245,29 +245,27 @@ class TestTaintVector:
 
         session, _ = engine._get_session("taint-01")
         assert session.is_tainted is True
-        (origin,) = session.taint_vector
-        assert origin.taint_source == "web__fetch:http://evil.example/page"
-        assert origin.trigger_pattern == "AGENT_TARGET_HEADER"
+        tool_origins = [o for o in session.labels["untrusted"] if o.rule == "tool:web__fetch"]
+        assert [o.source for o in tool_origins] == ["web__fetch:http://evil.example/page"]
 
         context = client.get("/session/taint-01").json()
-        assert context["taint_vector"][0]["trigger_pattern"] == "AGENT_TARGET_HEADER"
+        assert "tool:web__fetch" in {o["rule"] for o in context["labels"]["untrusted"]}
 
     def test_static_mapping_records_origin(self, engine):
         allowed, _, _ = engine.evaluate_transition("taint-02", "web_search", {"query": "x"})
         assert allowed
+        engine.record_source("taint-02", "web_search", {"query": "x"})
         session, _ = engine._get_session("taint-02")
-        (origin,) = session.taint_vector
-        assert origin.taint_source == "web_search:x"
-        assert origin.trigger_pattern == "STATIC_POLICY_MAPPING"
+        (origin,) = session.labels["untrusted"]
+        assert origin.source == "web_search:x"
+        assert origin.rule == "tool:web_search"
 
-    def test_latch_blocks_write_and_reports_vector(self, engine):
-        engine.taint_session(
-            "taint-03", taint_source="fs__read_file:notes.txt", trigger_pattern="HEADER_DIRECTIVE"
-        )
+    def test_label_blocks_write_and_reports_origins(self, engine):
+        engine.label("taint-03", "untrusted", source="fs__read_file:notes.txt", rule="path:**/inbox/**")
         engine.evaluate_transition("taint-03", "fs__read_file")
         allowed, _, meta = engine.evaluate_transition("taint-03", "fs__write_file")
         assert not allowed
-        assert meta["taint_vector"] == ["fs__read_file:notes.txt"]
+        assert [o["source"] for o in meta["labels"]["untrusted"]] == ["fs__read_file:notes.txt"]
 
     def test_unknown_session_context_is_404(self, client):
         assert client.get("/session/never-seen").status_code == 404
@@ -300,13 +298,14 @@ class TestStateHistory:
 
     def test_history_is_bounded_but_invariants_survive(self, policy):
         engine = SessionGraphManager(policy, max_history=5)
-        engine.evaluate_transition("hist-03", "web_search")  # taint early
+        engine.evaluate_transition("hist-03", "web_search")  # label early
+        engine.record_source("hist-03", "web_search", {"query": "x"})
         for _ in range(20):
             engine.evaluate_transition("hist-03", "fs__read_file")
         session, _ = engine._get_session("hist-03")
         assert len(session.state_history) == 5
         assert len(engine.get_session_history("hist-03")) == 5
-        # The tainting step has scrolled out of history; the latch has not
+        # The labeling step has scrolled out of history; the label has not
         allowed, _, _ = engine.evaluate_transition("hist-03", "fs__write_file")
         assert not allowed
 
@@ -320,7 +319,7 @@ class TestSessionExpiry:
     def test_idle_session_expires(self, policy):
         clock = _FakeClock()
         engine = SessionGraphManager(policy, session_ttl=10, clock=clock)
-        engine.taint_session("ttl-01")
+        engine.label("ttl-01", "untrusted")
         clock.now += 11
         assert engine.peek_state("ttl-01") is ToolState.START
         assert engine.get_session_context("ttl-01") is None
@@ -330,7 +329,7 @@ class TestSessionExpiry:
     def test_activity_refreshes_ttl(self, policy):
         clock = _FakeClock()
         engine = SessionGraphManager(policy, session_ttl=10, clock=clock)
-        engine.taint_session("ttl-02")
+        engine.label("ttl-02", "untrusted")
         for _ in range(5):
             clock.now += 8
             engine.evaluate_transition("ttl-02", "fs__read_file")
@@ -351,10 +350,12 @@ class TestSessionExpiry:
     def test_zero_ttl_disables_expiry(self, policy):
         clock = _FakeClock()
         engine = SessionGraphManager(policy, session_ttl=0, clock=clock)
-        engine.taint_session("ttl-03")
+        engine.label("ttl-03", "untrusted")
+        engine.evaluate_transition("ttl-03", "fs__read_file")
         clock.now += 10**9
         assert engine.purge_expired() == 0
-        assert engine.peek_state("ttl-03") is ToolState.UNTRUSTED_INGEST
+        assert engine.peek_state("ttl-03") is ToolState.LOCAL_READ
+        assert engine.get_session_context("ttl-03")["labels"].keys() == {"untrusted"}
 
 
 # ===========================================================================
@@ -372,7 +373,7 @@ class TestSessionIsolation:
             for _ in range(25):
                 engine.evaluate_transition(sid, "fs__read_file")
             if poison:
-                engine.taint_session(sid, taint_source=sid)
+                engine.label(sid, "untrusted", source=sid)
             engine.evaluate_transition(sid, "fs__write_file")
 
         threads = [
@@ -388,15 +389,15 @@ class TestSessionIsolation:
             session, _ = engine._get_session(sid)
             last = engine.get_session_history(sid)[-1]
             if i % 2 == 0:
-                assert [o.taint_source for o in session.taint_vector] == [sid]
-                assert last.status == "BLOCKED_INVARIANT"
+                assert [o.source for o in session.labels["untrusted"]] == [sid]
+                assert last.status == "BLOCKED_LABEL"
             else:
                 assert session.is_tainted is False
                 assert last.status == "ALLOWED"
                 assert session.current_state is ToolState.LOCAL_WRITE
 
-    def test_in_flight_taint_blocks_concurrent_call(self, app):
-        """A write sent while a poisoned fetch is in flight must see its taint."""
+    def test_in_flight_label_blocks_concurrent_call(self, app):
+        """A write sent while a fetch is in flight must see the fetch's label."""
         fs_calls: list[dict] = []
 
         async def scenario() -> list[dict]:
@@ -434,5 +435,6 @@ class TestSessionIsolation:
         fetch_body, write_body = asyncio.run(scenario())
         assert "result" in fetch_body
         assert write_body["error"]["code"] == -32001
-        assert write_body["error"]["data"]["current_state"] == "UNTRUSTED_INGEST"
+        assert write_body["error"]["data"]["current_state"] == "NETWORK_EGRESS"
+        assert write_body["error"]["data"]["check"] == "label_sink"
         assert fs_calls == []

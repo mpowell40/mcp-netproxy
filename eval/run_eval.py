@@ -47,6 +47,8 @@ SCENARIOS = EVAL / "scenarios"
 CONTAINER_ROOT = "/mcp-proxy-testbed"
 FS_CONTAINER = "mcp-unprotected"
 PROXY_CONTAINER = "mcp-protected"
+SESSION_HEADER = "Mcp-Session-Id"     # proxy-issued session token
+PUBLIC_ID_HEADER = "X-Proxy-Session"   # public id for /session/{id} lookups
 
 # Host trees the harness resets between runs and diffs for outcome checks.
 SANDBOX = REPO / "sandbox"
@@ -241,12 +243,29 @@ def guard_refusals(since: float) -> list[tuple[float, str]]:
     return refusals
 
 
+def open_session(client: httpx.Client, proxy: str, name: str) -> tuple[dict, str]:
+    """``initialize`` against the proxy; return (headers to send, public session id).
+
+    Token mode: the proxy issues ``Mcp-Session-Id``.  A proxy running with
+    ``MCP_SESSION_MODE=legacy`` issues none, so fall back to ``X-Session-ID``.
+    """
+    payload = {"jsonrpc": "2.0", "id": 0, "method": "initialize",
+               "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                          "clientInfo": {"name": "mcp-netproxy-eval", "version": name}}}
+    r = client.post(f"{proxy}/mcp", json=payload, timeout=30.0)
+    r.raise_for_status()
+    token = r.headers.get(SESSION_HEADER)
+    if token:
+        return {SESSION_HEADER: token}, r.headers[PUBLIC_ID_HEADER]
+    return {"X-Session-ID": name}, name
+
+
 def run_through_proxy(client: httpx.Client, proxy: str, scenario: dict, rep: int) -> dict:
-    sid = f"eval-{scenario['id']}-r{rep}-{uuid.uuid4().hex[:6]}"
+    headers, sid = open_session(client, proxy, f"eval-{scenario['id']}-r{rep}-{uuid.uuid4().hex[:6]}")
     calls = []
     for i, c in enumerate(scenario["calls"]):
         start = time.time()
-        body, ms = _post(client, f"{proxy}/mcp", _rpc(i, c["tool"], c["args"]), {"X-Session-ID": sid})
+        body, ms = _post(client, f"{proxy}/mcp", _rpc(i, c["tool"], c["args"]), headers)
         calls.append({"body": body, "ms": ms, "window": (start, time.time())})
 
     events = client.get(f"{proxy}/session/{sid}/events", timeout=10.0).json()["events"]
@@ -535,8 +554,9 @@ def main() -> int:
         meta["post_floor_ms"] = statistics.median(floor)
 
         # Handshake once like a real client, so discovery has run before any call.
+        warmup_headers, _ = open_session(client, args.proxy, "eval-warmup")
         client.post(f"{args.proxy}/mcp", json={"jsonrpc": "2.0", "id": 0, "method": "tools/list", "params": {}},
-                    headers={"X-Session-ID": "eval-warmup"}, timeout=30.0).raise_for_status()
+                    headers=warmup_headers, timeout=30.0).raise_for_status()
 
         for s in scenarios:
             verdicts, proxy_ms, base_ms = [], defaultdict(list), defaultdict(list)

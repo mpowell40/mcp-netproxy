@@ -1,7 +1,8 @@
 """mcp-netproxy: Zero Trust Policy Enforcement Point for MCP tool calls.
 
-Combines regex-based heuristic inspection with Behavioral State-Machine
-Invariant Enforcement and Egress Response Scanning across multiple
+Combines regex-based heuristic inspection, provenance-based information
+flow control (sticky ``untrusted`` / ``secret`` session labels) and
+Behavioral State-Machine Invariant Enforcement across multiple
 downstream MCP backends declared in the ``backends:`` registry of
 ``config/policy.yaml`` (e.g., Filesystem MCP as ``fs``, Fetch MCP as ``web``).
 
@@ -13,9 +14,9 @@ previously-unseen tools.
 
 Every frame emits structured ``ProxyEvent`` telemetry at the
 BEFORE/AFTER_TOOL_LIST and BEFORE/AFTER_TOOL_CALL checkpoints.  Calls
-within one session are serialized end-to-end (DFA check -> forward ->
-response scan) so a call cannot slip past a taint that an in-flight
-response is about to latch.
+within one session are serialized end-to-end (label/DFA check -> forward
+-> labeling) so a call cannot slip past a label that an in-flight
+response is about to apply.  The ingest scanner only raises alerts.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ import os
 import pathlib
 import re
 import sys
+import time
 import weakref
 from typing import Any, Callable
 
@@ -39,6 +41,7 @@ from src.engine.egress import EgressGuard
 from src.engine.events import Checkpoint, Decision, EventCollector, ProxyEvent
 from src.engine.ingest_scanner import scan_payload_for_untrusted_directives
 from src.engine.registry import BackendRegistry, ToolResolutionError
+from src.engine.session_tokens import PUBLIC_ID_HEADER, SESSION_HEADER, SessionTokenStore
 from src.engine.state_machine import DEFAULT_SESSION_TTL, SessionGraphManager, describe_source
 from src.models.policy import PolicyConfig, ToolState
 
@@ -62,7 +65,11 @@ _DEFAULT_POLICY = pathlib.Path(__file__).resolve().parent.parent / "config" / "p
 # Heuristic inspection patterns (Layer 1).  Path traversal is decided by the
 # canonicalizing sandbox check, not by matching "../" in the raw arguments.
 SENSITIVE_PATH_PATTERN = r"(/etc/|~/\.ssh|~/\.env)"
+# Shell metacharacters only matter where a shell may interpret them, so this
+# check runs only for tools mapped to EXECUTE.  File contents, URLs and
+# search queries legitimately contain ';', '|', "curl" or "bash".
 SHELL_INJECTION = r"(;|\||\&\&|\bcurl\b|\bbash\b)"
+_SHELL_CHECKED_STATES = {ToolState.EXECUTE}
 AWS_KEY_PATTERN = r"(AKIA[0-9A-Z]{16})"
 
 # Namespace that ``fetch_downstream_url`` overrides (legacy create_app kwarg)
@@ -76,6 +83,8 @@ def create_app(
     fetch_downstream_url: str | None = None,
     backend_urls: dict[str, str] | None = None,
     event_collector: EventCollector | None = None,
+    session_mode: str | None = None,
+    token_clock: Callable[[], float] | None = None,
 ) -> FastAPI:
     """Factory function for the FastAPI application.
 
@@ -84,6 +93,12 @@ def create_app(
     ``backend_urls`` overrides them per namespace.  ``downstream_url`` and
     ``fetch_downstream_url`` are kept as shorthands for overriding the
     default backend and the ``web`` backend respectively.
+
+    ``session_mode`` (default: ``MCP_SESSION_MODE`` env, else ``token``)
+    selects how sessions are identified.  ``token``: the proxy mints an
+    ``Mcp-Session-Id`` on ``initialize`` and requires it on every other
+    request.  ``legacy``: client-chosen ``X-Session-ID``, falling back to
+    the client IP (kept for unit tests and old clients only).
     """
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -120,6 +135,20 @@ def create_app(
     )
     _events = event_collector or EventCollector()
 
+    _session_mode = (session_mode or os.getenv("MCP_SESSION_MODE", "token")).strip().lower()
+    if _session_mode not in ("token", "legacy"):
+        raise ValueError(f"MCP_SESSION_MODE must be 'token' or 'legacy', got '{_session_mode}'")
+    if _session_mode == "legacy":
+        logger.warning(
+            "[SESSION] Legacy session mode: sessions are client-chosen X-Session-ID values "
+            "(fallback: client IP). Use only for tests or trusted clients."
+        )
+    _tokens = SessionTokenStore(
+        ttl=float(os.getenv("SESSION_TTL_SECONDS", DEFAULT_SESSION_TTL)),
+        clock=token_clock or time.monotonic,
+        on_expire=_engine.reset_session,
+    )
+
     url_overrides = dict(backend_urls or {})
     if downstream_url and _policy.default_backend:
         url_overrides.setdefault(_policy.default_backend, downstream_url)
@@ -133,6 +162,8 @@ def create_app(
     app.state.engine = _engine
     app.state.registry = _registry
     app.state.events = _events
+    app.state.session_mode = _session_mode
+    app.state.session_tokens = _tokens
 
     # One asyncio.Lock per in-flight session; entries vanish once unused.
     _session_gates: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
@@ -178,9 +209,20 @@ def create_app(
         except Exception:
             return _jsonrpc_error(None, -32700, "Parse error: Invalid JSON payload", status=400)
 
+        if not isinstance(payload, dict):
+            return _jsonrpc_error(None, -32600, "Invalid Request: expected a JSON-RPC object", status=400)
         request_id = payload.get("id")
         method = payload.get("method", "")
-        session_id = _session_id(request)
+
+        # -- Session identity ------------------------------------------
+        if _session_mode == "legacy":
+            session_id = _legacy_session_id(request)
+        elif method == "initialize":
+            return await _handle_initialize(payload)
+        else:
+            session_id = _tokens.resolve(request.headers.get(SESSION_HEADER))
+            if session_id is None:
+                return _session_error(request, request_id)
 
         # -- tools/list: multiplex across backends & auto-classify ---------
         if method == "tools/list":
@@ -194,11 +236,77 @@ def create_app(
                 return _jsonrpc_error(request_id, -32601, "No backend registered", status=200)
             return await _forward(payload, _registry.url(default_ns), app.state.http_client)
 
-        # -- Serialize this session's calls across check -> forward -> scan --
-        # Without this, a second call evaluated while a scanned response is
-        # still in flight would miss the taint that response is about to latch.
+        # -- Serialize this session's calls across check -> forward -> label --
+        # Without this, a second call evaluated while a response is still in
+        # flight would miss the labels that response is about to apply.
         async with _session_gate(session_id):
             return await _handle_tool_call(payload, session_id)
+
+    async def _handle_initialize(payload: dict[str, Any]) -> Response:
+        """Forward ``initialize`` and issue a fresh session token for this connection.
+
+        Any token the client sent along is ignored: every handshake starts a
+        new, untainted session, and only the proxy decides its identity.
+        """
+        default_ns = _registry.default_namespace
+        if default_ns is None:
+            return _jsonrpc_error(payload.get("id"), -32601, "No backend registered", status=200)
+        response = await _forward(payload, _registry.url(default_ns), app.state.http_client)
+        if response.status_code >= 400:
+            return response
+        params = payload.get("params")
+        client_info = params.get("clientInfo") if isinstance(params, dict) else None
+        token, public_id = _tokens.mint(client_info)
+        response.headers[SESSION_HEADER] = token
+        response.headers[PUBLIC_ID_HEADER] = public_id
+        name = client_info.get("name") if isinstance(client_info, dict) else None
+        logger.info(f"[SESSION] Opened session '{public_id}' for client '{name or 'unknown'}'")
+        return response
+
+    def _session_error(request: Request, request_id: Any) -> Response:
+        """Reject a request that lacks a live proxy-issued session token."""
+        token = request.headers.get(SESSION_HEADER)
+        if request.headers.get("X-Session-ID") is not None:
+            logger.warning("[SESSION] Ignoring client-chosen X-Session-ID (token mode)")
+        if not token:
+            return _jsonrpc_error(
+                request_id, -32600,
+                f"Missing session token: send 'initialize' first and echo the {SESSION_HEADER} header",
+                status=400,
+            )
+        logger.warning("[SECURITY BLOCKED - SESSION] Request with unknown or expired session token")
+        return _jsonrpc_error(
+            request_id, -32600, "Unknown or expired session: re-initialize to obtain a new token",
+            status=404,
+        )
+
+    # -----------------------------------------------------------------------
+    # DELETE /mcp  –  explicit session termination (MCP Streamable HTTP)
+    # -----------------------------------------------------------------------
+    @app.delete("/mcp")
+    async def terminate_session(request: Request) -> Response:
+        """End the session named by ``Mcp-Session-Id`` and drop its DFA state."""
+        if _session_mode == "legacy":
+            return Response(status_code=405)
+        public_id = _tokens.revoke(request.headers.get(SESSION_HEADER))
+        if public_id is None:
+            return Response(status_code=404)
+        logger.info(f"[SESSION] Terminated session '{public_id}'")
+        return Response(status_code=204)
+
+    # -----------------------------------------------------------------------
+    # GET /sessions  –  live sessions (public ids only)
+    # -----------------------------------------------------------------------
+    @app.get("/sessions")
+    async def list_sessions() -> dict:
+        """List live token sessions with their taint status."""
+        rows = _tokens.list() if _session_mode == "token" else []
+        for row in rows:
+            context = _engine.get_session_context(row["session_id"])
+            row["current_state"] = context["current_state"] if context else "START"
+            row["is_tainted"] = bool(context and context["is_tainted"])
+            row["labels"] = sorted(context["labels"]) if context and context.get("labels") else []
+        return {"session_mode": _session_mode, "sessions": rows}
 
     async def _handle_tool_call(payload: dict[str, Any], session_id: str) -> Response:
         """Run one ``tools/call`` through the BEFORE/AFTER_TOOL_CALL checkpoints."""
@@ -240,7 +348,10 @@ def create_app(
 
         # -- Layer 1: Heuristic & Scope Boundary inspection -------------
         is_sensitive_path = bool(re.search(SENSITIVE_PATH_PATTERN, arg_string))
-        is_shell = bool(re.search(SHELL_INJECTION, arg_string))
+        is_shell = (
+            _policy.resolve_state(resolved.canonical, arguments) in _SHELL_CHECKED_STATES
+            and bool(re.search(SHELL_INJECTION, arg_string))
+        )
         is_aws_key = bool(re.search(AWS_KEY_PATTERN, arg_string))
 
         # Scope boundary check: path arguments must stay inside the backend sandbox
@@ -285,9 +396,13 @@ def create_app(
                 f"[SECURITY BLOCKED - DFA INVARIANT] Session '{session_id}' denied transition: "
                 f"tool='{resolved.canonical}', state='{meta['from_state']}' -> '{meta['to_state']}', reason='{reason}'"
             )
+            # Label sink blocks are part of Layer 2 ("dfa"); ``check`` names
+            # which Layer 2 check fired.
+            extra = {k: meta[k] for k in ("check", "sink_rules", "labels") if k in meta}
             block(
                 "dfa", reason, resolved.canonical,
                 current_state=meta["from_state"], target_state=meta["to_state"], status=meta["status"],
+                **extra,
             )
             return _jsonrpc_error(
                 request_id,
@@ -298,6 +413,7 @@ def create_app(
                     "attempted_tool": resolved.canonical,
                     "target_state": meta["to_state"],
                     "reason": reason,
+                    **extra,
                 },
                 status=200,
             )
@@ -309,6 +425,20 @@ def create_app(
                 request_id, -32601, f"No backend serves tool '{tool_name}'", status=200
             )
         target_backend = _registry.url(resolved.namespace)
+
+        # -- File labels: propagate before forwarding (fail closed) ---------
+        try:
+            labeled_paths = _engine.record_write(session_id, resolved.canonical, arguments)
+        except OSError as exc:
+            reason = f"File label store unavailable: {exc}"
+            logger.error(f"[SECURITY BLOCKED - FILE LABELS] Session '{session_id}': {reason}")
+            block("dfa", reason, resolved.canonical, check="file_label_store")
+            return _jsonrpc_error(
+                request_id, -32001, "Security Invariant Violation",
+                data={"attempted_tool": resolved.canonical, "reason": reason, "check": "file_label_store"},
+                status=200,
+            )
+
         _emit(
             Checkpoint.BEFORE_TOOL_CALL,
             session_id,
@@ -319,6 +449,7 @@ def create_app(
             target_state=meta["to_state"],
             backend=resolved.namespace,
             upstream_tool=resolved.upstream,
+            **({"labeled_paths": labeled_paths} if labeled_paths else {}),
         )
         logger.info(
             f"[MULTI-BACKEND DISPATCH] Routing tool='{resolved.canonical}' for session='{session_id}' "
@@ -327,10 +458,28 @@ def create_app(
         upstream_payload = {**payload, "params": {**params, "name": resolved.upstream}}
         response = await _forward(upstream_payload, target_backend, app.state.http_client)
 
-        # -- Layer 3: Dynamic Ingest Scanner (response inspection) --------
+        after: dict[str, Any] = {"scanned": False, "status_code": response.status_code}
+
+        # -- Provenance labels --------------------------------------------
+        # Whatever the backend returned (results, JSON-RPC errors, isError
+        # results) reached the agent, so the source's labels apply.  Only a
+        # proxy-generated connection failure carries no backend data.
+        if not isinstance(response, _ForwardFailure):
+            applied = _engine.record_source(
+                session_id, resolved.canonical, arguments, _response_text(response.body)
+            )
+            if applied:
+                after["labels_applied"] = [o.to_dict() for o in applied]
+                logger.info(
+                    f"[PROVENANCE] Session '{session_id}' labeled "
+                    f"{sorted({o.label for o in applied})} by '{resolved.canonical}'"
+                )
+
+        # -- Layer 3: Ingest Scanner (alert only) --------------------------
         # For content-returning tools on backends with scan_responses enabled,
-        # scan the response payload for imperative prompt-injection directives.
-        after: dict[str, Any] = {"scanned": False, "tainted": False, "status_code": response.status_code}
+        # scan the response for imperative prompt-injection directives.  A
+        # match is an alert for operators: it never changes the session's
+        # labels or DFA state (wording is evadable; provenance decides).
         if _registry.should_scan(resolved, ToolState(meta["to_state"])):
             after["scanned"] = True
             try:
@@ -348,27 +497,19 @@ def create_app(
                 if full_text.strip():
                     scan_result = scan_payload_for_untrusted_directives(full_text)
                     if scan_result.is_untrusted:
-                        # Retroactively taint the session with sticky latch
-                        taint_source = describe_source(resolved.canonical, arguments)
-                        _engine.taint_session(
-                            session_id,
-                            ToolState.UNTRUSTED_INGEST,
-                            taint_source=taint_source,
-                            trigger_pattern=scan_result.pattern_id,
-                            reason=scan_result.reason,
-                        )
-                        after.update(
-                            tainted=True,
-                            taint_source=taint_source,
-                            trigger_pattern=scan_result.pattern_id,
-                            reason=scan_result.reason,
-                        )
+                        alert = {
+                            "pattern_id": scan_result.pattern_id,
+                            "source": describe_source(resolved.canonical, arguments),
+                            "reason": scan_result.reason,
+                        }
+                        _engine.record_alert(session_id, alert)
+                        after["alerts"] = [alert]
                         logger.warning(
-                            f"[DYNAMIC INGEST SCANNER] Session '{session_id}' tainted "
-                            f"with UNTRUSTED_INGEST from tool '{resolved.canonical}'. Reason: {scan_result.reason}"
+                            f"[INGEST SCANNER ALERT] Session '{session_id}': {scan_result.pattern_id} "
+                            f"in response from '{alert['source']}' (alert only; labels unchanged)"
                         )
             except Exception as exc:
-                # Non-parseable response — leave session state as-is
+                # Non-parseable response: nothing to scan
                 after["scan_error"] = type(exc).__name__
 
         _emit(Checkpoint.AFTER_TOOL_CALL, session_id, resolved.canonical, Decision.ALLOW, request_id, **after)
@@ -416,8 +557,11 @@ def create_app(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _session_id(request: Request) -> str:
-    """Session key: X-Session-ID, else the client host.
+def _legacy_session_id(request: Request) -> str:
+    """Legacy session key: X-Session-ID, else the client host.
+
+    Only used when ``MCP_SESSION_MODE=legacy``: the client chooses its own
+    session, so it can switch IDs to shed a taint latch.
 
     The host (not host:port) is deliberate: keying on the ephemeral port
     would let a client shed its taint latch simply by reconnecting.
@@ -459,6 +603,32 @@ async def _backend_client(shared: httpx.AsyncClient | None):
             yield client
 
 
+def _response_text(body: bytes) -> str:
+    """All text a backend response hands the agent (result content and error text)."""
+    try:
+        parsed = json.loads(body)
+    except (ValueError, TypeError):
+        return body.decode("utf-8", "replace") if isinstance(body, bytes) else ""
+    if not isinstance(parsed, dict):
+        return ""
+    parts: list[str] = []
+    result = parsed.get("result")
+    if isinstance(result, dict):
+        for block in result.get("content", []) or []:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                parts.append(block["text"])
+    error = parsed.get("error")
+    if isinstance(error, dict):
+        parts.append(str(error.get("message", "")))
+        if "data" in error:
+            parts.append(json.dumps(error["data"]))
+    return "\n".join(parts)
+
+
+class _ForwardFailure(Response):
+    """Proxy-generated error: the backend was never reached or never answered."""
+
+
 async def _forward(payload: dict, downstream_url: str, shared: httpx.AsyncClient | None = None) -> Response:
     """Forward a JSON-RPC payload to the specified downstream MCP server."""
     async with _backend_client(shared) as client:
@@ -470,12 +640,13 @@ async def _forward(payload: dict, downstream_url: str, shared: httpx.AsyncClient
                 media_type="application/json",
             )
         except Exception as exc:
-            return _jsonrpc_error(
+            error = _jsonrpc_error(
                 payload.get("id"),
                 -32000,
                 f"Downstream connection error: {exc}",
                 status=502,
             )
+            return _ForwardFailure(content=error.body, status_code=502, media_type="application/json")
 
 
 async def _handle_tools_list(

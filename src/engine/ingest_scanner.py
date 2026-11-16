@@ -1,8 +1,12 @@
-"""Egress Response Scanner for Dynamic Untrusted Ingest Detection.
+"""Ingest Response Scanner (alert only).
 
 Inspects text payloads returned by file-read or tool-read operations for
 imperative prompt-injection directives.  Uses deterministic regex
 pattern matching — no LLM calls or external services.
+
+A match is recorded as an alert in telemetry.  It does not label the
+session or move the DFA: wording is trivially evadable (eval scenario
+LA06), so enforcement is decided by provenance labels instead.
 
 Typical scan overhead: < 0.05 ms per payload.
 """

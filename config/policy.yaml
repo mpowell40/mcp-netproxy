@@ -20,7 +20,8 @@
 #   sandbox_roots   prefixes that every path argument must stay within
 #   path_arguments  argument names (string or list) checked against roots
 #   scan_responses  run the ingest scanner on LOCAL_READ/UNTRUSTED_INGEST/
-#                   NETWORK_EGRESS responses (sticky taint on injection directives)
+#                   NETWORK_EGRESS responses (alert only: a match is logged in
+#                   telemetry and never changes labels or DFA state)
 #   url_arguments   argument names checked against egress (default: [url])
 #   egress          outbound URL policy: schemes, exact-host allowlist, and
 #                   private_hosts (allowlisted hosts that may resolve to
@@ -69,8 +70,8 @@ backends:
         - fetch-backend      # internal Docker address
     tools:
       # Outbound request: the URL itself can carry data off-host, so fetch
-      # is egress.  Its response is still external content and is scanned;
-      # taint is applied by the ingest scanner rather than on every fetch.
+      # is egress.  Every response is external content and labels the
+      # session untrusted (labels.sources.untrusted.tools), whatever it says.
       fetch: NETWORK_EGRESS
 
 # ----------------------------------------------------------------------------
@@ -82,7 +83,7 @@ tool_mappings:
   # Discovery tools
   list_tools: DISCOVERY
 
-  # Untrusted external data ingestion (unconditional static taint)
+  # Untrusted external data ingestion (also untrusted sources by tool label)
   browser_action: UNTRUSTED_INGEST
   web_search: UNTRUSTED_INGEST
   scrape_url: UNTRUSTED_INGEST
@@ -96,6 +97,83 @@ tool_mappings:
   send_webhook: NETWORK_EGRESS
   upload_file: NETWORK_EGRESS
   send_email: NETWORK_EGRESS
+
+# ----------------------------------------------------------------------------
+# Provenance labels (information flow control)
+# ----------------------------------------------------------------------------
+# A session is labeled by WHERE its data came from, never by what it says.
+# Labels are sticky: they only accumulate, and only a session reset or TTL
+# expiry clears them.
+#
+#   sources            label -> {axis, tools, paths}
+#                      tools: every response of these canonical tools
+#                      paths: globs over the canonical realpath of each path
+#                             argument ("**" spans segments, "*" stays in one;
+#                             no leading "/" = match anywhere in the path)
+#   path_label_states  DFA states whose path arguments carry path labels
+#                      (LOCAL_WRITE included: edit_file returns a diff of the
+#                      file it edits)
+#   sinks              DFA states each label may not reach.  Checked before
+#                      the transition graph; a block returns -32001 with the
+#                      session's labels and their origins.
+#   file_labels        a LOCAL_WRITE by a labeled session (write_file,
+#                      edit_file, create_directory, move_file) stores its
+#                      labels on the canonical destination path; move_file
+#                      also carries the source path's labels.  Later reads of
+#                      the path (or anything under it) get those labels.
+#                      Persisted as JSON at store_path (env override:
+#                      MCP_FILE_LABEL_STORE).  Not covered: writes through
+#                      tools the proxy does not classify as LOCAL_WRITE, and
+#                      files changed outside the proxy.
+#   value_tracking     secondary defense: fragments of secret-looking values
+#                      read from a tracked source are refused in later calls
+#                      into these sinks.  Encoding or paraphrase evades it;
+#                      the labels are the guarantee.
+labels:
+  sources:
+    untrusted:
+      axis: integrity
+      tools:
+        - web__fetch        # every fetched page, whatever it says
+        - browser_action
+        - web_search
+        - scrape_url
+      paths:
+        - sandbox/**/inbox/**
+    secret:
+      axis: confidentiality
+      paths:
+        - "**/secrets/**"
+        - "**/*.env"
+        - "**/credentials*"
+
+  path_label_states: [LOCAL_READ, DISCOVERY, LOCAL_WRITE]
+
+  file_labels:
+    store_path: /app/state/file_labels.json   # proxy-state volume (docker-compose.yml)
+    source_arguments: [source]                # move_file: carry these paths' labels
+
+  sinks:
+    - label: untrusted
+      # Strict: an untrusted session cannot fetch again either.  To allow
+      # repeat fetches, drop NETWORK_EGRESS from this list.
+      block: [LOCAL_WRITE, EXECUTE, NETWORK_EGRESS]
+      reason: >-
+        Session holds untrusted-origin data; it cannot drive file writes,
+        command execution or network egress (indirect prompt injection).
+    - label: secret
+      block: [NETWORK_EGRESS, EXECUTE]
+      reason: >-
+        Session holds secret-origin data; it cannot reach network egress or
+        command execution (exfiltration).
+
+  value_tracking:
+    enabled: true
+    labels: [secret]
+    sinks: [NETWORK_EGRESS, EXECUTE]
+    fragment_length: 7          # same window as the eval's canary fragment check
+    min_value_length: 8
+    max_fragments_per_session: 4096
 
 # ----------------------------------------------------------------------------
 # Layer 1 argument limits (rejected before forwarding)
@@ -157,8 +235,10 @@ allowed_transitions:
   NETWORK_EGRESS:
     - DISCOVERY
     - LOCAL_READ
-    # Only reachable while the session is untainted: the sticky taint latch
-    # blocks every LOCAL_WRITE once the scanner has flagged ingested content.
+    - NETWORK_EGRESS  # consecutive outbound calls; label sinks still apply
+    # Reachable only by an egress tool that is not an untrusted source:
+    # every fetch labels the session untrusted, and the untrusted sink rule
+    # blocks LOCAL_WRITE before this graph is consulted.
     - LOCAL_WRITE
 
 # Invariant rules that trigger fatal violations regardless of allowed_transitions.
