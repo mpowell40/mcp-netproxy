@@ -24,7 +24,10 @@ PASS   Phase 4 frozen: 27/28 attacks blocked (96.4%), 0/26 false positives (eval
 
 You can also run it on a clean GitHub runner: **Actions → reproduce → Run workflow**.
 
-**Before the first run:** the Phase 4 check needs the `phase4-frozen` tag (`git fetch --tags`).
+**Before the first run:**
+- Docker must be running. On Windows, start Docker Desktop and wait for "Engine running".
+- The Phase 4 check needs the `phase4-frozen` tag (`git fetch --tags`).
+- The first run builds the images, which takes a few minutes and needs internet.
 
 ## Claims
 
@@ -35,7 +38,7 @@ You can also run it on a clean GitHub runner: **Actions → reproduce → Run wo
 | Phase 5 live: 8/8 blocked, 4/12 FP | `config/policy.phase5.live.yaml` | see below | `eval/runs/phase5-live/` | **Indicative**: depends on live websites |
 | Phase 4 live: 5/8 blocked, 0/12 FP | `config/policy.live.yaml` | see below | `eval/runs/live/` | **Indicative** |
 | Median added latency ~7 ms (p95 ~18 ms) | — | any eval run (`summary.md`) | `eval/runs/final/` | **Indicative**: measured on Docker Desktop for Windows, where `realpath` crosses the file-sharing layer. A Linux host measured ~3 ms. |
-| 282 unit and integration tests pass | current code | `python -m pytest tests/ -q` | — | `ci.yml` on every push |
+| 282 unit and integration tests pass (280 + 2 skipped on Windows: symlink tests need POSIX) | current code | `python -m pytest tests/ -q` | — | `ci.yml` on every push |
 
 ### Live-internet sets (not part of the one-command check)
 

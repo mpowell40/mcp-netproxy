@@ -71,7 +71,16 @@ fi
 
 # 2. Phase 5 (current code): dev set vs eval/runs/phase5-dev ---------------
 echo "== Phase 5 dev set (config/policy.yaml)"
-compose_up mcp-netproxy "$ROOT" compose/eval.yml && wait_for_proxy
+if ! docker info >/dev/null 2>&1; then
+  echo "Docker is not reachable. Start Docker (Desktop) and re-run." >&2
+  record FAIL "Docker not running: evaluation checks were not run"
+  printf '%s\n' "${RESULTS[@]}"; exit 1
+fi
+if ! compose_up mcp-netproxy "$ROOT" compose/eval.yml; then
+  record FAIL "Phase 5 dev: testbed did not start (docker compose up failed)"
+  printf '%s\n' "${RESULTS[@]}"; exit 1
+fi
+wait_for_proxy
 # Start from an empty persistent file label store, as the reported run did
 docker exec mcp-protected rm -f /app/state/file_labels.json >/dev/null 2>&1 && docker restart mcp-protected >/dev/null && wait_for_proxy
 "$PY" eval/run_eval.py --set dev --reps "$REPS" --out "$OUT/phase5-dev" >"$OUT/phase5-dev.log" 2>&1

@@ -44,8 +44,23 @@ function Wait-Proxy {
 function Compose-Up($project, $dir, $overlay) {
     $flag = if ($NoBuild) { "--no-build" } else { "--build" }
     Push-Location $dir
-    docker compose -p $project -f docker-compose.yml -f $overlay up -d $flag | Out-Null
+    docker compose -p $project -f docker-compose.yml -f $overlay up -d $flag
+    $ok = ($LASTEXITCODE -eq 0)
     Pop-Location
+    if (-not $ok) { Write-Host "docker compose up failed for $project (see output above)" -ForegroundColor Red }
+    return $ok
+}
+
+function Assert-Docker {
+    docker info *> $null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Docker is not reachable. Start Docker Desktop, wait until it says 'Engine running', then re-run." -ForegroundColor Red
+        Write-Host ""
+        Write-Host "== Reproduction summary"
+        $Results | ForEach-Object { Write-Host $_ }
+        Write-Host "FAIL   Docker not running: evaluation checks were not run"
+        exit 1
+    }
 }
 function Compose-Down($project, $dir, $overlay) {
     Push-Location $dir
@@ -62,7 +77,8 @@ if (-not $SkipTests) {
 
 # 2. Phase 5 (current code): dev set vs eval/runs/phase5-dev
 Write-Host "== Phase 5 dev set (config/policy.yaml)"
-Compose-Up "mcp-netproxy" $Root "compose/eval.yml"
+Assert-Docker
+if (-not (Compose-Up "mcp-netproxy" $Root "compose/eval.yml")) { Record "FAIL" "Phase 5 dev: testbed did not start"; $Results | ForEach-Object { Write-Host $_ }; exit 1 }
 Wait-Proxy | Out-Null
 docker exec mcp-protected rm -f /app/state/file_labels.json | Out-Null
 docker restart mcp-protected | Out-Null
@@ -86,7 +102,7 @@ if ($Phase4) {
         Copy-Item backends/filesystem/Dockerfile, backends/filesystem/requirements.txt, backends/filesystem/server.py "$Wt/mcp-filesystem-backend/" -Force
         Copy-Item backends/fetch/Dockerfile, backends/fetch/requirements.txt "$Wt/mcp-fetch-backend/" -Force
         Copy-Item Dockerfile, requirements.txt "$Wt/" -Force
-        Compose-Up "mcp-netproxy-phase4" $Wt "tests/eval/docker-compose.eval.yml"
+        Compose-Up "mcp-netproxy-phase4" $Wt "tests/eval/docker-compose.eval.yml" | Out-Null
         Wait-Proxy | Out-Null
         Push-Location $Wt
         & $Python eval/run_eval.py --set all --reps $Reps --out "$Out/phase4-all" *> "$Out/phase4-all.log"
@@ -101,7 +117,7 @@ if ($Phase4) {
         else { Record "FAIL" "Phase 4 frozen: see $Out/phase4-all" }
         Compose-Down "mcp-netproxy-phase4" $Wt "tests/eval/docker-compose.eval.yml"
         git worktree remove --force $Wt
-        Compose-Up "mcp-netproxy" $Root "compose/eval.yml"
+        Compose-Up "mcp-netproxy" $Root "compose/eval.yml" | Out-Null
     } else {
         Record "FAIL" "Phase 4 frozen: tag phase4-frozen not found (git fetch --tags)"
     }
