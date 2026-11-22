@@ -16,15 +16,119 @@ See [Evaluation Results](#evaluation-results). To regenerate every reported numb
 
 ## Table of Contents
 
+- [How to Reproduce](#how-to-reproduce)
 - [Threat Model](#threat-model)
 - [Architecture](#architecture)
 - [Project Structure](#project-structure)
 - [Getting Started](#getting-started)
 - [Running the Evaluation](#running-the-evaluation)
 - [Claude Desktop Demo](#claude-desktop-demo)
+- [Live dashboard and scripted demo](#live-dashboard-and-scripted-demo)
 - [Inspecting Sessions](#inspecting-sessions)
 - [Evaluation Results](#evaluation-results)
 - [Known Limitations](#known-limitations)
+
+---
+
+## How to Reproduce
+
+This workflow goes from a clean clone to every reported result. Each fresh run is checked **scenario by scenario** against the committed run in `eval/runs/`, comparing outcome, first blocked call, layer and leaks, so a match means the same verdicts, not only the same percentages. [REPRODUCING.md](REPRODUCING.md) has the full claims table.
+
+### Requirements
+
+| | |
+| --- | --- |
+| OS | Linux, macOS, or Windows with Docker Desktop (WSL 2). Verified on Linux and on Windows |
+| Docker | Docker Engine or Docker Desktop with Compose v2, **running** (`docker info` must show a Server version) |
+| Python | 3.11 or newer on the host (tests, eval harness, comparison) |
+| Disk / network | About 2 GB for images. Internet on the first build (Docker Hub, PyPI, npm); evaluations then run offline |
+| Time | First image build: about 5–10 min. Full check: about 1–2 min on Linux, longer on Docker Desktop |
+
+All versions are pinned:
+- `requirements.txt` and `requirements-dev.txt` (Python)
+- `mcp-server-fetch==2026.10.19` (`backends/fetch/requirements.txt`)
+- `@modelcontextprotocol/server-filesystem@2026.8.31`, installed at image build time (`backends/filesystem/Dockerfile`)
+- `python:3.11-slim-bookworm` and `node:20-bookworm-slim` base images
+
+### Steps
+
+1. **Clone the submitted version:**
+   ```bash
+   git clone https://github.com/mpowell40/mcp-netproxy.git
+   ```
+   ```bash
+   cd mcp-netproxy
+   ```
+   ```bash
+   git checkout checkpoint4
+   ```
+   `checkpoint4` is the tag for the Checkpoint 4 submission commit. A clone also fetches the `phase4-frozen` and `phase5-eval` tags that the checks below rely on.
+
+2. **Install the host dependencies:**
+   ```bash
+   pip install -r requirements-dev.txt
+   ```
+
+3. **Run every check with one command.** This builds the images, runs the tests, runs each evaluation and compares it with the committed results:
+   ```bash
+   scripts/reproduce.sh --phase4
+   ```
+   On Windows (PowerShell):
+   ```powershell
+   .\scripts\reproduce.ps1 -Phase4
+   ```
+
+4. **Expected output** (the last lines):
+   ```text
+   PASS   pytest: unit + integration tests
+   PASS   Phase 5 dev: 21/22 attacks blocked, 3/21 false positives (eval/runs/phase5-dev)
+   PASS   Tool poisoning: 4/4 attacks blocked, 0/3 false positives (eval/runs/tools)
+   PASS   Phase 4 frozen: 27/28 attacks blocked (96.4%), 0/26 false positives (eval/runs/final)
+   ```
+   The script exits 0 only if every line is `PASS`. On a mismatch, it prints which scenarios differ and in which field. The fresh runs are kept in the temp folder named in the summary.
+
+### What each check does (manual equivalent)
+
+| Check | Commands | Compared with | Expected |
+| --- | --- | --- | --- |
+| Unit and integration tests | `python -m pytest tests/ -q` | — | 313 passed (2 symlink tests are skipped on Windows) |
+| Phase 5 dev set (current policy) | `docker compose -f docker-compose.yml -f compose/eval.yml up -d --build`, then `python eval/run_eval.py --set dev --out run5`, then `python eval/compare_runs.py eval/runs/phase5-dev run5` | `eval/runs/phase5-dev/` | 21/22 attacks blocked, 3/21 false positives (H06, H07, H12), `MATCH: all 43 scenarios` |
+| Tool poisoning / rug pull | `python eval/run_tool_eval.py --out runT`, then `python eval/compare_runs.py eval/runs/tools runT` | `eval/runs/tools/` | 4/4 blocked, 0/3 false positives, `MATCH: all 7 scenarios` |
+| Phase 4 frozen set (dev + holdout) | The script unpacks tag `phase4-frozen` (the Phase 4 policy frozen at `8c566d3`) with today's pinned backend images and runs `run_eval.py --set all` | `eval/runs/final/` | 27/28 blocked (96.4%), 0/26 false positives; holdout 6/6 and 0/5 |
+
+Before a manual Phase 5 or tool run, empty the persistent stores the way the script does:
+```bash
+docker exec mcp-protected rm -f /app/state/file_labels.json /app/state/manifest_pins.json
+```
+```bash
+docker restart mcp-protected
+```
+
+### Indicative only (not checked by the script)
+
+- **Live-internet sets** (`eval/runs/live/`, `eval/runs/phase5-live/`) fetch real public pages (httpbin.org, jsonplaceholder.typicode.com), whose content and availability change. Commands are in [REPRODUCING.md](REPRODUCING.md#live-internet-sets-not-part-of-the-one-command-check).
+- **Latency.** The reported ~7 ms median overhead was measured on Docker Desktop for Windows, where `realpath` crosses the file-sharing layer. A Linux host measures less. Latency figures are relative, not deadlines. In-proxy stage timing and native-Linux percentiles are planned work (see below).
+
+### Committed vs. fetched at build time
+
+- **Committed:** all code, policies, scenarios (`eval/scenarios*/`), fixtures (`sandbox/`, `backends/fetch/fixtures/`, fake canary secrets), and every reported run (`eval/runs/`). Holdout rows are kept out of the repo (`eval/**/.holdout/`); their aggregate lines are in `eval/runs/final/summary.md`.
+- **Fetched (pinned):** base images from Docker Hub, Python packages from PyPI, and the filesystem MCP server from npm.
+
+### Not reproducible yet (the work doesn't exist)
+
+These are planned, not missing evidence:
+- per-stage timing CSVs from inside the proxy
+- native-Linux latency percentiles with CPU pinning and cgroup limits
+- the JSON parse microbenchmark
+
+### Troubleshooting
+
+| Symptom | Fix |
+| --- | --- |
+| `Docker is not reachable` / `dockerDesktopLinuxEngine` | Start Docker Desktop and wait for "Engine running" |
+| `container name … already in use` | A stack from another folder is running. The scripts remove the testbed containers themselves; when running manually, use `docker compose -f docker-compose.yml -f compose/eval.yml down` first |
+| `invalid file request Dockerfile` (files of ~31 bytes) | The checkout contains cloud-sync placeholders (e.g. OneDrive). Clone into a folder that isn't synced |
+| Phase 4 check: `tag phase4-frozen not found` | `git fetch --tags` |
 
 ---
 
@@ -212,7 +316,7 @@ pip install -r requirements-dev.txt
 python -m pytest tests/ -v
 ```
 
-Expected: all tests pass. One symlink test is skipped on Windows because it needs POSIX paths and unprivileged symlinks.
+Expected: 313 tests pass. Two symlink tests are skipped on Windows because they need POSIX paths and unprivileged symlinks.
 
 ### 3. Start the testbed
 
@@ -225,8 +329,10 @@ docker compose up -d --build
 | `mcp-protected` | `protected` | `8000` | **mcp-netproxy**: send traffic here |
 | `mcp-unprotected` | `unprotected` | `9000` | Filesystem backend, reachable directly as an *unprotected baseline* |
 | `mcp-fetch-backend` | `fetch-backend` | `9001` | Fetch backend + HTML fixtures; outbound traffic goes through the egress guard |
+| `mcp-notes-backend` | `notes-backend` | `9002` (localhost only) | Demo third-party server for tool poisoning / rug pulls |
+| `mcp-eval-redirect` | `eval-redirect` | — | Eval-only redirect service (added by `compose/eval.yml`) |
 
-The repo root is bind-mounted at `/mcp-proxy-testbed` in all three containers.
+The repo root is bind-mounted at `/mcp-proxy-testbed` in the proxy and the filesystem and fetch backends.
 
 ### 4. Send a request
 
@@ -418,3 +524,13 @@ These are self-authored scenarios against a self-authored server. They show that
 
 ---
 
+## Known Limitations
+
+- **The evaluation is self-authored.** The scenarios were written by the project author, who could see the policy. The Phase 4 holdout was run once on a frozen policy. Phase 5 and the tool-poisoning set are dev results, and a blind holdout is planned (`eval/scenarios_phase5_holdout/`).
+- **Provenance has a usability cost.** Every fetch-then-write and fetch-then-fetch session is refused (Phase 5 false positives: 3/21 dev, 4/12 live). There is no declassification step yet.
+- **Sessions are per connection, not per chat.** MCP carries no conversation ID, so all chats on one Claude Desktop connection share labels.
+- **Value tracking can be evaded** by encoding or splitting a secret. The `secret` label's sink rule is the guarantee.
+- **The regex scanner only raises alerts** and doesn't block (wording is evadable).
+- **A21 (`chain_recon`) is still missed** in both phases.
+- **Latency figures are relative.** They're end-to-end through Docker. In-proxy stage timing, native-Linux percentiles and the JSON parse microbenchmark are planned work, not measured results.
+- **The testbed paths are fixed** (`/mcp-proxy-testbed/...`), and there is no stdio wrap mode or package install yet.
