@@ -60,9 +60,9 @@ All versions are pinned:
    cd mcp-netproxy
    ```
    ```bash
-   git checkout checkpoint4
+   git checkout checkpoint5
    ```
-   `checkpoint4` is the tag for the Checkpoint 4 submission commit. A clone also fetches the `phase4-frozen` and `phase5-eval` tags that the checks below rely on.
+   `checkpoint5` is the tag for the Checkpoint 5 submission commit (`checkpoint4` marks the Checkpoint 4 submission). A clone also fetches the `phase4-frozen` and `phase5-eval` tags that the checks below rely on.
 
 2. **Install the host dependencies:**
    ```bash
